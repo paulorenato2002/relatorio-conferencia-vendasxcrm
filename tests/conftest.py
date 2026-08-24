@@ -35,6 +35,7 @@ def build_cash_pdf(
     total="4.080,40",
     branch="MORANA JARDIM BOTANICO SHOPPING",
     include_cash=True,
+    include_pix=True,
     extra_sales_lines=(),
     name="fechamento.pdf",
 ) -> NamedBytesIO:
@@ -52,12 +53,9 @@ def build_cash_pdf(
     lines.extend(extra_sales_lines)
     if include_cash:
         lines.append(f"DINHEIRO {cash} 0,00 0,00 {cash}")
-    lines.extend(
-        [
-            f"PIX {pix} 0,00 0,00 {pix}",
-            f"TOTAL DESTA LOJA {total} 0,00 0,00 {total}",
-        ]
-    )
+    if include_pix:
+        lines.append(f"PIX {pix} 0,00 0,00 {pix}")
+    lines.append(f"TOTAL DESTA LOJA {total} 0,00 0,00 {total}")
     for line in lines:
         pdf.drawString(40, y, line)
         y -= 22

@@ -50,7 +50,7 @@ class CashClosing:
     pix_cents: int
     cash_cents: int
     store_total_cents: int
-    cash_zero_verified_from_total: bool = False
+    absent_payment_methods: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

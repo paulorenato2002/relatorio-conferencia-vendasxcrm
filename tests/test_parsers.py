@@ -40,7 +40,7 @@ def test_cash_pdf_parser_with_provided_sample(caixa_path):
     assert closing.branch == "MORANA JARDIM BOTANICO SHOPPING"
 
 
-def test_rezende_cash_pdf_is_identified_by_branch_and_proves_zero_cash():
+def test_rezende_cash_pdf_is_identified_with_absent_cash_as_zero():
     source = build_cash_pdf(
         company="",
         day="16/07/2026",
@@ -60,22 +60,42 @@ def test_rezende_cash_pdf_is_identified_by_branch_and_proves_zero_cash():
     assert closing.pix_cents == 57_511
     assert closing.cash_cents == 0
     assert closing.store_total_cents == 332_364
-    assert closing.cash_zero_verified_from_total
+    assert closing.absent_payment_methods == ("DINHEIRO",)
 
     batch = parse_cash_pdfs([source])
-    assert any("saldo R$ 0,00 comprovado" in warning for warning in batch.warnings)
+    assert any(
+        "DINHEIRO não aparece" in warning and "R$ 0,00" in warning
+        for warning in batch.warnings
+    )
 
 
-def test_missing_cash_line_without_total_proof_is_blocking():
+def test_missing_pix_and_cash_lines_are_zero_with_warnings():
     source = build_cash_pdf(
         company="",
         branch="MORANA ASA NORTE BSB",
         include_cash=False,
-        pix="10,00",
+        include_pix=False,
         total="100,00",
-        name="caixa-sem-prova.pdf",
+        name="CAIXA 05.pdf",
     )
-    with pytest.raises(CashPdfParseError, match="não foi possível comprovar saldo zero"):
+    closing = parse_cash_pdf(source)
+    assert closing.pix_cents == 0
+    assert closing.cash_cents == 0
+    assert closing.absent_payment_methods == ("PIX", "DINHEIRO")
+
+    batch = parse_cash_pdfs([source])
+    assert len(batch.warnings) == 2
+    assert any("PIX não aparece" in warning for warning in batch.warnings)
+    assert any("DINHEIRO não aparece" in warning for warning in batch.warnings)
+
+
+def test_present_payment_line_without_readable_balance_is_blocking():
+    source = build_cash_pdf(
+        include_pix=False,
+        extra_sales_lines=("PIX saldo indisponível",),
+        name="caixa-pix-ilegivel.pdf",
+    )
+    with pytest.raises(CashPdfParseError, match="linha 'PIX'.*Saldo está ilegível"):
         parse_cash_pdf(source)
 
 

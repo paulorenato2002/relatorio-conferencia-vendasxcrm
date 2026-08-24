@@ -64,9 +64,10 @@ As amostras não informam a filial ou o CNPJ da L2H. Quando esses identificadore
 
 - Cabeçalhos de CRM e Rede são localizados mesmo fora da primeira linha e normalizados quanto a acentos, espaços e maiúsculas.
 - Datas brasileiras são interpretadas com dia antes do mês; datas ISO, células Excel e seriais Excel também são aceitos.
-- PDF sem texto extraível, sem formato reconhecível, sem PIX ou sem total gera erro.
-  `DINHEIRO` omitido só vale zero quando a soma das demais formas de pagamento
-  confere exatamente com o total da loja.
+- PDF sem texto extraível, sem formato reconhecível ou sem total gera erro.
+  Quando as linhas `PIX` ou `DINHEIRO` não aparecem, a forma de pagamento é
+  considerada sem movimento (`R$ 0,00`) e a validação exibe um aviso. Se a linha
+  existir, mas o saldo estiver ilegível, o processamento é bloqueado.
 - Fechamento ausente não é tratado como zero: o dia fica `PENDENTE`, os campos de
   PIX/dinheiro/cálculo permanecem não informados e o PDF solicita o reenvio do fechamento.
 - PDF duplicado com os mesmos valores é ignorado com aviso; valores conflitantes bloqueiam.

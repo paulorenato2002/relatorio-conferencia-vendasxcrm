@@ -71,46 +71,17 @@ def _extract_date(text: str, file_name: str) -> date:
     return parse_date_value(candidates[0])
 
 
-def _extract_line_balance(text: str, label: str, file_name: str) -> int:
+def _extract_line_balance_optional(text: str, label: str, file_name: str) -> int | None:
     for line in text.splitlines():
         normalized = normalize_text(line)
         if re.match(rf"^{re.escape(normalize_text(label))}\b", normalized):
             values = _MONEY_RE.findall(line)
             if values:
                 return parse_money_cents(values[-1])
-    raise CashPdfParseError(
-        f"{file_name}: não foi possível identificar a linha '{label}' e seu Saldo."
-    )
-
-
-def _extract_line_balance_optional(text: str, label: str) -> int | None:
-    for line in text.splitlines():
-        normalized = normalize_text(line)
-        if re.match(rf"^{re.escape(normalize_text(label))}\b", normalized):
-            values = _MONEY_RE.findall(line)
-            if values:
-                return parse_money_cents(values[-1])
+            raise CashPdfParseError(
+                f"{file_name}: a linha '{label}' foi localizada, mas seu Saldo está ilegível."
+            )
     return None
-
-
-def _sales_balances_before_total(text: str) -> list[int]:
-    balances: list[int] = []
-    inside_sales = False
-    for line in text.splitlines():
-        normalized = normalize_text(line)
-        if normalized == "vendas":
-            inside_sales = True
-            continue
-        if not inside_sales:
-            continue
-        if re.match(r"^total\b", normalized):
-            break
-        if normalized.startswith("forma "):
-            continue
-        values = _MONEY_RE.findall(line)
-        if values:
-            balances.append(parse_money_cents(values[-1]))
-    return balances
 
 
 def _extract_store_total(text: str, file_name: str) -> int:
@@ -132,20 +103,16 @@ def parse_cash_pdf(source: BinarySource) -> CashClosing:
     text = _extract_text(source, file_name)
     company, legal_name = _extract_company(text, file_name)
     day = _extract_date(text, file_name)
-    pix_cents = _extract_line_balance(text, "PIX", file_name)
     store_total_cents = _extract_store_total(text, file_name)
-    cash_cents = _extract_line_balance_optional(text, "DINHEIRO")
-    cash_zero_verified = False
+    absent_payment_methods: list[str] = []
+    pix_cents = _extract_line_balance_optional(text, "PIX", file_name)
+    if pix_cents is None:
+        pix_cents = 0
+        absent_payment_methods.append("PIX")
+    cash_cents = _extract_line_balance_optional(text, "DINHEIRO", file_name)
     if cash_cents is None:
-        visible_balances = _sales_balances_before_total(text)
-        if visible_balances and sum(visible_balances) == store_total_cents:
-            cash_cents = 0
-            cash_zero_verified = True
-        else:
-            raise CashPdfParseError(
-                f"{file_name}: a linha 'DINHEIRO' não aparece e não foi possível "
-                "comprovar saldo zero pela totalização das formas de pagamento."
-            )
+        cash_cents = 0
+        absent_payment_methods.append("DINHEIRO")
     branch_match = re.search(r"^\s*Filial\s*:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)
     branch = branch_match.group(1).strip() if branch_match else None
     return CashClosing(
@@ -157,7 +124,7 @@ def parse_cash_pdf(source: BinarySource) -> CashClosing:
         pix_cents=pix_cents,
         cash_cents=cash_cents,
         store_total_cents=store_total_cents,
-        cash_zero_verified_from_total=cash_zero_verified,
+        absent_payment_methods=tuple(absent_payment_methods),
     )
 
 
@@ -170,10 +137,10 @@ def parse_cash_pdfs(sources: list[BinarySource] | tuple[BinarySource, ...]) -> C
         previous = closings.get(key)
         if previous is None:
             closings[key] = closing
-            if closing.cash_zero_verified_from_total:
+            for method in closing.absent_payment_methods:
                 warnings.append(
-                    f"{closing.file_name}: DINHEIRO não aparece no PDF; saldo R$ 0,00 "
-                    "comprovado porque a soma das formas de pagamento confere com o Total da loja."
+                    f"{closing.file_name}: {method} não aparece no fechamento; "
+                    "valor considerado R$ 0,00 por ausência de vendas nessa forma de pagamento."
                 )
             continue
         comparable = (
