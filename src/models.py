@@ -118,3 +118,81 @@ class ReconciliationReport:
         if self.pending_days:
             return "PENDENTE"
         return "OK" if self.divergent_days == 0 else "DIVERGÊNCIA"
+
+
+@dataclass(frozen=True, slots=True)
+class BoletaItem:
+    """Peça lançada na boleta. `codigo` tem 10 dígitos, como impresso na etiqueta."""
+
+    codigo: str
+    value_cents: int
+    handwritten: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Boleta:
+    source_file: str
+    page: int
+    position: int
+    numero: str | None
+    numero_controle: str | None
+    date: date | None
+    seller: str | None
+    client: str | None
+    phone: str | None
+    items: tuple[BoletaItem, ...]
+    returns: tuple[BoletaItem, ...]
+    sub_total_cents: int | None
+    discount_cents: int | None
+    total_cents: int | None
+    piece_count: int | None
+    payment_method: str | None
+    installments: int | None
+    card_brand: str | None
+    flags: frozenset[str]
+    unreadable_fields: tuple[str, ...]
+    checks: tuple[str, ...]
+
+    @property
+    def image_id(self) -> str:
+        return f"{self.source_file}#p{self.page}b{self.position}"
+
+    @property
+    def needs_review(self) -> bool:
+        return bool(self.checks or self.unreadable_fields)
+
+    @property
+    def items_total_cents(self) -> int:
+        return sum(item.value_cents for item in self.items)
+
+
+@dataclass(slots=True)
+class BoletaData:
+    file_names: tuple[str, ...]
+    boletas: tuple[Boleta, ...]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def all_dates(self) -> set[date]:
+        return {boleta.date for boleta in self.boletas if boleta.date is not None}
+
+    @property
+    def sellers(self) -> tuple[str, ...]:
+        return tuple(sorted({b.seller for b in self.boletas if b.seller}))
+
+    @property
+    def review_queue(self) -> tuple[Boleta, ...]:
+        return tuple(boleta for boleta in self.boletas if boleta.needs_review)
+
+    def daily_by_seller(self) -> dict[date, dict[str, int]]:
+        totals: dict[date, dict[str, int]] = {}
+        for boleta in self.boletas:
+            if boleta.date is None or boleta.total_cents is None:
+                continue
+            seller = boleta.seller or "(SEM VENDEDORA)"
+            totals.setdefault(boleta.date, {}).setdefault(seller, 0)
+            totals[boleta.date][seller] += boleta.total_cents
+        return totals
+
+    def total_on(self, day: date) -> int:
+        return sum(self.daily_by_seller().get(day, {}).values())

@@ -6,6 +6,14 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
+from src.boletas import (
+    BoletaClientError,
+    BoletaParseError,
+    N8nConfig,
+    build_boletas,
+    fetch_boletas,
+    render_many,
+)
 from src.diagnostics import suggest_observations
 from src.formatters import format_brl_cents, format_brl_currency, format_date_br
 from src.parsers import (
@@ -50,6 +58,54 @@ def _fingerprint(company, start_date, end_date, crm_file, rede_file, cash_files)
         digest.update(upload.name.encode("utf-8", errors="replace"))
         digest.update(upload.getvalue())
     return digest.hexdigest()
+
+
+def _streamlit_secrets() -> dict[str, str]:
+    """`st.secrets` estoura quando não existe secrets.toml. Ausência não é erro."""
+    try:
+        return {key: str(value) for key, value in st.secrets.items()}
+    except Exception:
+        return {}
+
+
+def _boletas_fingerprint(boleta_files) -> str | None:
+    """Impressão digital só dos arquivos de boleta.
+
+    A leitura no n8n é a única etapa paga do fluxo. Manter a chave presa aos
+    arquivos faz com que mudar empresa ou período reaproveite a transcrição já
+    obtida em vez de mandar as mesmas imagens de novo.
+    """
+    if not boleta_files:
+        return None
+    digest = hashlib.sha256()
+    for upload in boleta_files:
+        digest.update(upload.name.encode("utf-8", errors="replace"))
+        digest.update(upload.getvalue())
+    return digest.hexdigest()
+
+
+def _boletas_dataframe(data) -> pd.DataFrame:
+    rows = []
+    for boleta in data.boletas:
+        pagamento = boleta.payment_method or "—"
+        if boleta.payment_method == "credito" and boleta.installments:
+            pagamento = f"crédito {boleta.installments}x"
+        rows.append(
+            {
+                "Arquivo": f"{boleta.source_file} (p{boleta.page}/{boleta.position})",
+                "Nº": boleta.numero or "—",
+                "Data": format_date_br(boleta.date) if boleta.date else "Não lida",
+                "Vendedora": boleta.seller or "—",
+                "Cliente": boleta.client or "—",
+                "Peças": boleta.piece_count if boleta.piece_count is not None else "—",
+                "Itens lidos": len(boleta.items),
+                "Total": format_brl_cents(boleta.total_cents) if boleta.total_cents is not None else "Não lido",
+                "Pagamento": pagamento,
+                "Bandeira": boleta.card_brand or "—",
+                "Conferência": "Revisar" if boleta.needs_review else "OK",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _daily_dataframe(report) -> pd.DataFrame:
@@ -102,7 +158,7 @@ with st.container(border=True):
     with col_end:
         end_date = st.date_input("Data final", value=date.today(), format="DD/MM/YYYY")
 
-    col_crm, col_rede, col_cash = st.columns(3)
+    col_crm, col_rede, col_cash, col_boletas = st.columns(4)
     with col_crm:
         crm_file = st.file_uploader("CRM Morana (.xlsx)", type=["xlsx"], key="crm")
     with col_rede:
@@ -110,6 +166,14 @@ with st.container(border=True):
     with col_cash:
         cash_files = st.file_uploader(
             "Fechamentos de caixa (.pdf)", type=["pdf"], accept_multiple_files=True, key="cash"
+        )
+    with col_boletas:
+        boleta_files = st.file_uploader(
+            "Boletas escaneadas",
+            type=["pdf", "png", "jpg", "jpeg", "webp", "tif", "tiff"],
+            accept_multiple_files=True,
+            key="boletas",
+            help="Scans com várias boletas por página são recortados automaticamente.",
         )
 
     validate_clicked = st.button("Validar arquivos", type="primary", use_container_width=True)
@@ -190,6 +254,97 @@ else:
                 "CNPJs Rede": sorted(rede_data.cnpjs),
             }
         )
+
+st.subheader("Boletas")
+boletas_fingerprint = _boletas_fingerprint(boleta_files)
+boletas_state = st.session_state.get("boletas")
+boletas_are_current = bool(
+    boletas_state and boletas_fingerprint and boletas_state.get("fingerprint") == boletas_fingerprint
+)
+
+if not boleta_files:
+    st.info(
+        "Envie as boletas escaneadas para incluí-las na conferência. "
+        "A leitura é feita pelo n8n e roda sob demanda."
+    )
+else:
+    read_clicked = st.button(
+        "Ler boletas no n8n",
+        use_container_width=True,
+        disabled=boletas_are_current,
+        help="Já lido: reenvie apenas se trocar os arquivos." if boletas_are_current else None,
+    )
+    if read_clicked:
+        progress = st.progress(0.0, text="Recortando as boletas...")
+        try:
+            images = render_many(list(boleta_files))
+            progress.progress(0.0, text=f"0 de {len(images)} boletas lidas...")
+
+            def _on_progress(done: int, total: int) -> None:
+                progress.progress(done / total, text=f"{done} de {total} boletas lidas...")
+
+            raw, warnings = fetch_boletas(
+                images, config=N8nConfig.from_env(_streamlit_secrets()), on_progress=_on_progress
+            )
+            st.session_state["boletas"] = {
+                "fingerprint": boletas_fingerprint,
+                "raw": raw,
+                "warnings": warnings,
+                "file_names": tuple(dict.fromkeys(image.source_file for image in images)),
+            }
+            boletas_state = st.session_state["boletas"]
+            boletas_are_current = True
+        except (BoletaParseError, BoletaClientError, ValueError) as exc:
+            st.session_state.pop("boletas", None)
+            st.error(str(exc))
+        finally:
+            progress.empty()
+
+if boletas_are_current:
+    # A montagem é pura: mudar o período apenas recalcula o ano das datas,
+    # que as boletas não trazem escrito. Não há nova chamada ao n8n.
+    boletas_data = build_boletas(
+        boletas_state["raw"],
+        start_date,
+        end_date,
+        file_names=boletas_state["file_names"],
+        warnings=boletas_state["warnings"],
+    )
+    review = boletas_data.review_queue
+    boleta_cols = st.columns(3)
+    boleta_cols[0].metric("Boletas lidas", len(boletas_data.boletas))
+    boleta_cols[1].metric("Conferem sozinhas", len(boletas_data.boletas) - len(review))
+    boleta_cols[2].metric("Precisam de revisão", len(review))
+
+    for message in boletas_data.warnings:
+        st.warning(message)
+
+    fora_do_periodo = sorted(
+        day for day in boletas_data.all_dates if not (start_date <= day <= end_date)
+    )
+    if fora_do_periodo:
+        st.warning(
+            "Boletas com data fora do período selecionado: "
+            + ", ".join(format_date_br(day) for day in fora_do_periodo)
+        )
+
+    st.dataframe(_boletas_dataframe(boletas_data), hide_index=True, use_container_width=True)
+
+    if review:
+        st.caption(
+            "As boletas abaixo não fecham sozinhas ou têm campo ilegível. "
+            "Confira no papel antes de usar o resultado."
+        )
+        with st.expander(f"Revisão pendente ({len(review)})", expanded=True):
+            for boleta in review:
+                rotulo = f"{boleta.source_file} · p{boleta.page}/{boleta.position}"
+                if boleta.numero:
+                    rotulo += f" · Nº {boleta.numero}"
+                st.markdown(f"**{rotulo}**")
+                for check in boleta.checks:
+                    st.markdown(f"- {check}")
+                for field in boleta.unreadable_fields:
+                    st.markdown(f"- campo `{field}` preenchido no papel, mas ilegível")
 
 process_enabled = bool(
     validation_is_current
