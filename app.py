@@ -14,6 +14,19 @@ from src.boletas import (
     fetch_boletas,
     render_many,
 )
+from src.boletas.edicao import (
+    PAGAMENTOS,
+    files_signature,
+    frames_from_raw,
+    raw_from_frames,
+    signature,
+)
+from src.crosscheck import (
+    KIND_MISSING_IN_BOLETA,
+    KIND_MISSING_IN_CRM,
+    KIND_SUSPECT_READ,
+    crosscheck,
+)
 from src.diagnostics import suggest_observations
 from src.formatters import format_brl_cents, format_brl_currency, format_date_br
 from src.parsers import (
@@ -68,22 +81,6 @@ def _streamlit_secrets() -> dict[str, str]:
         return {}
 
 
-def _boletas_fingerprint(boleta_files) -> str | None:
-    """Impressão digital só dos arquivos de boleta.
-
-    A leitura no n8n é a única etapa paga do fluxo. Manter a chave presa aos
-    arquivos faz com que mudar empresa ou período reaproveite a transcrição já
-    obtida em vez de mandar as mesmas imagens de novo.
-    """
-    if not boleta_files:
-        return None
-    digest = hashlib.sha256()
-    for upload in boleta_files:
-        digest.update(upload.name.encode("utf-8", errors="replace"))
-        digest.update(upload.getvalue())
-    return digest.hexdigest()
-
-
 def _boletas_dataframe(data) -> pd.DataFrame:
     rows = []
     for boleta in data.boletas:
@@ -106,6 +103,45 @@ def _boletas_dataframe(data) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _crosscheck_dataframe(report) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Data": format_date_br(row.date),
+                "Boletas": row.boleta_count,
+                "Fora do cruzamento": row.excluded_boletas,
+                "Peças casadas": row.matched_items,
+                "Só na boleta": row.only_boleta,
+                "Só no CRM": row.only_crm,
+                "Leitura suspeita": row.suspect_reads,
+                "Bruto boletas": format_brl_cents(row.boleta_gross_cents),
+                "Bruto CRM": format_brl_cents(row.crm_gross_cents),
+                "Diferença": format_brl_cents(row.gross_difference_cents),
+                "Status": row.status,
+            }
+            for row in report.rows
+        ]
+    )
+
+
+def _discrepancy_dataframe(items) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Data": format_date_br(item.date),
+                "Código": item.codigo,
+                "Valor": format_brl_cents(item.value_cents),
+                "Tipo": "Devolução" if item.is_return else "Venda",
+                "Vendedora": item.seller or "—",
+                "Boleta": item.boleta_numero or (item.boleta_id or "—"),
+                "Venda CRM": item.sale_number or "—",
+                "Produto": item.product or "—",
+            }
+            for item in items
+        ]
+    )
 
 
 def _daily_dataframe(report) -> pd.DataFrame:
@@ -256,8 +292,12 @@ else:
         )
 
 st.subheader("Boletas")
-boletas_fingerprint = _boletas_fingerprint(boleta_files)
-boletas_state = st.session_state.get("boletas")
+boletas_data = None
+boletas_fingerprint = files_signature(boleta_files)
+# Chave diferente do `key="boletas"` do uploader de propósito: o Streamlit
+# grava o valor de cada widget no session_state sob a chave do widget, e
+# reaproveitar o nome faz a lista de arquivos sobrescrever este cache.
+boletas_state = st.session_state.get("boletas_leitura")
 boletas_are_current = bool(
     boletas_state and boletas_fingerprint and boletas_state.get("fingerprint") == boletas_fingerprint
 )
@@ -286,25 +326,55 @@ else:
             raw, warnings = fetch_boletas(
                 images, config=N8nConfig.from_env(_streamlit_secrets()), on_progress=_on_progress
             )
-            st.session_state["boletas"] = {
+            st.session_state["boletas_leitura"] = {
                 "fingerprint": boletas_fingerprint,
                 "raw": raw,
                 "warnings": warnings,
                 "file_names": tuple(dict.fromkeys(image.source_file for image in images)),
             }
-            boletas_state = st.session_state["boletas"]
+            boletas_state = st.session_state["boletas_leitura"]
             boletas_are_current = True
         except (BoletaParseError, BoletaClientError, ValueError) as exc:
-            st.session_state.pop("boletas", None)
+            st.session_state.pop("boletas_leitura", None)
             st.error(str(exc))
         finally:
             progress.empty()
 
+boletas_aprovadas = False
 if boletas_are_current:
-    # A montagem é pura: mudar o período apenas recalcula o ano das datas,
-    # que as boletas não trazem escrito. Não há nova chamada ao n8n.
+    raw_original = boletas_state["raw"]
+
+    # Os editores partem sempre da leitura original. O que o usuário corrigiu
+    # vive no estado do próprio `data_editor`; realimentar o editor com o
+    # resultado já corrigido faria as linhas adicionadas serem reaplicadas a
+    # cada execução e duplicarem.
+    cabecalhos_lidos = frames_from_raw(raw_original)
+
+    st.caption(
+        "Confira o que foi lido e corrija direto na tabela. A correção passa "
+        "pelas mesmas checagens da leitura automática."
+    )
+    cabecalhos_editados = st.data_editor(
+        cabecalhos_lidos,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["Boleta"],
+        column_config={
+            "Boleta": st.column_config.TextColumn("Arquivo", width="medium"),
+            "Data": st.column_config.TextColumn(
+                "Data", help="Como está escrito na boleta, ex.: 22/09", width="small"
+            ),
+            "Peças": st.column_config.NumberColumn("Peças", min_value=0, step=1, width="small"),
+            "Pagamento": st.column_config.SelectboxColumn("Pagamento", options=PAGAMENTOS),
+        },
+        key="editor_cabecalhos",
+    )
+
+    raw_corrigido = raw_from_frames(raw_original, cabecalhos_editados)
+    st.session_state["boletas_corrigidas"] = raw_corrigido
+
     boletas_data = build_boletas(
-        boletas_state["raw"],
+        raw_corrigido,
         start_date,
         end_date,
         file_names=boletas_state["file_names"],
@@ -313,8 +383,8 @@ if boletas_are_current:
     review = boletas_data.review_queue
     boleta_cols = st.columns(3)
     boleta_cols[0].metric("Boletas lidas", len(boletas_data.boletas))
-    boleta_cols[1].metric("Conferem sozinhas", len(boletas_data.boletas) - len(review))
-    boleta_cols[2].metric("Precisam de revisão", len(review))
+    boleta_cols[1].metric("Conferem", len(boletas_data.boletas) - len(review))
+    boleta_cols[2].metric("A conferir", len(review))
 
     for message in boletas_data.warnings:
         st.warning(message)
@@ -328,14 +398,11 @@ if boletas_are_current:
             + ", ".join(format_date_br(day) for day in fora_do_periodo)
         )
 
-    st.dataframe(_boletas_dataframe(boletas_data), hide_index=True, use_container_width=True)
-
     if review:
-        st.caption(
-            "As boletas abaixo não fecham sozinhas ou têm campo ilegível. "
-            "Confira no papel antes de usar o resultado."
-        )
-        with st.expander(f"Revisão pendente ({len(review)})", expanded=True):
+        with st.expander(f"O que não fechou ({len(review)})", expanded=True):
+            st.caption(
+                "Corrija na tabela acima. O alerta some assim que a conta fechar."
+            )
             for boleta in review:
                 rotulo = f"{boleta.source_file} · p{boleta.page}/{boleta.position}"
                 if boleta.numero:
@@ -346,11 +413,44 @@ if boletas_are_current:
                 for field in boleta.unreadable_fields:
                     st.markdown(f"- campo `{field}` preenchido no papel, mas ilegível")
 
+    assinatura = signature(raw_corrigido)
+    boletas_aprovadas = st.session_state.get("boletas_aprovacao") == assinatura
+
+    if boletas_aprovadas:
+        st.success(
+            f"{len(boletas_data.boletas)} boleta(s) aprovadas. "
+            "A conferência já pode ser processada."
+        )
+    else:
+        rotulo = "Aprovar boletas e liberar a conferência"
+        if review:
+            rotulo = f"Aprovar mesmo com {len(review)} boleta(s) a conferir"
+            st.caption(
+                "Aprovar sem corrigir é possível: as boletas seguem marcadas e o "
+                "cruzamento não conclui divergência em cima delas."
+            )
+        if st.button(rotulo, type="primary", use_container_width=True):
+            st.session_state["boletas_aprovacao"] = assinatura
+            st.rerun()
+
 process_enabled = bool(
     validation_is_current
     and not validation_state.get("error")
     and validation_state["result"].is_valid
+    # Boleta lida e não aprovada trava o processamento: o relatório sairia com
+    # um cruzamento que o operador ainda não conferiu.
+    and (not boletas_are_current or boletas_aprovadas)
 )
+# A conferência processada precisa cair quando as boletas mudam: senão uma
+# correção feita depois de processar deixaria na tela um relatório montado
+# sobre os dados antigos, com aparência de atual.
+processed_fingerprint = current_fingerprint and "|".join(
+    [current_fingerprint, signature(st.session_state.get("boletas_corrigidas") or ())]
+)
+
+if boletas_are_current and not boletas_aprovadas:
+    st.info("Aprove as boletas acima para liberar o processamento da conferência.")
+
 process_clicked = st.button(
     "Processar conferência",
     type="primary",
@@ -372,13 +472,18 @@ if process_clicked:
         report, validation_state["crm"], validation_state["rede"]
     )
     st.session_state["processed"] = {
-        "fingerprint": current_fingerprint,
+        "fingerprint": processed_fingerprint,
         "report": report,
+        "crosscheck": (
+            crosscheck(start_date, end_date, validation_state["crm"], boletas_data)
+            if boletas_data is not None
+            else None
+        ),
     }
     st.session_state["observations"] = _observation_dataframe(report, suggestions)
 
 processed = st.session_state.get("processed")
-if processed and processed.get("fingerprint") == current_fingerprint:
+if processed and processed.get("fingerprint") == processed_fingerprint:
     report = processed["report"]
     st.divider()
     st.subheader("Resumo do período")
@@ -410,6 +515,94 @@ if processed and processed.get("fingerprint") == current_fingerprint:
     daily_df = _daily_dataframe(report)
     st.dataframe(daily_df, hide_index=True, use_container_width=True)
 
+    cross = processed.get("crosscheck")
+    if cross is not None and cross.rows:
+        st.divider()
+        st.subheader("Cruzamento boletas × CRM")
+        cruzadas = cross.totals["boletas"]
+        fora = cross.totals.get("excluded_boletas", 0)
+        resumo = f"{cruzadas} boleta(s) cruzadas"
+        if fora:
+            resumo += f", {fora} fora do cruzamento (data sob suspeita)"
+        st.caption(
+            f"{resumo}. Compara peça a peça pelo código de barras da etiqueta, "
+            "que é o mesmo código do CRM sem os zeros à esquerda."
+        )
+        cross_cols = st.columns(4)
+        cross_cols[0].metric("Peças casadas", cross.totals["matched_items"])
+        cross_cols[1].metric("Na boleta, fora do CRM", cross.totals["only_boleta"])
+        cross_cols[2].metric("No CRM, fora da boleta", cross.totals["only_crm"])
+        cross_cols[3].metric("Leitura suspeita", cross.totals["suspect_reads"])
+
+        if cross.days_divergent:
+            st.error(
+                f"{cross.days_divergent} dia(s) com peça sem correspondência entre "
+                "boleta e CRM."
+            )
+        elif cross.days_review:
+            st.warning(
+                f"{cross.days_review} dia(s) dependem de revisão manual antes de "
+                "concluir: há boleta com leitura duvidosa."
+            )
+        elif cross.days_ok:
+            st.success("Todas as peças das boletas enviadas batem com o CRM.")
+        if cross.days_without_boleta:
+            st.info(
+                f"{cross.days_without_boleta} dia(s) do período sem boleta enviada — "
+                "esses dias não foram cruzados."
+            )
+        if cross.totals.get("excluded_boletas"):
+            st.warning(
+                f"{cross.totals['excluded_boletas']} boleta(s) ficaram fora do "
+                "cruzamento por terem data sob suspeita. Enquanto a data não for "
+                "corrigida, as peças dessas boletas aparecem abaixo como “no CRM, "
+                "fora da boleta” — não são vendas sem registro."
+            )
+
+        st.dataframe(
+            _crosscheck_dataframe(cross), hide_index=True, use_container_width=True
+        )
+
+        sem_crm = cross.by_kind(KIND_MISSING_IN_CRM)
+        if sem_crm:
+            st.markdown("**Peças na boleta e fora do CRM**")
+            st.caption(
+                "Venda registrada no papel sem linha correspondente no sistema. "
+                "Confirme a peça na boleta física antes de tratar como não registrada."
+            )
+            st.dataframe(
+                _discrepancy_dataframe(sem_crm), hide_index=True, use_container_width=True
+            )
+
+        sem_boleta = cross.by_kind(KIND_MISSING_IN_BOLETA)
+        if sem_boleta:
+            st.markdown("**Peças no CRM e fora das boletas**")
+            st.caption("Venda no sistema sem boleta correspondente entre as enviadas.")
+            st.dataframe(
+                _discrepancy_dataframe(sem_boleta),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        suspeitas = cross.by_kind(KIND_SUSPECT_READ)
+        if suspeitas:
+            st.markdown("**Prováveis erros de leitura**")
+            st.caption(
+                "O código da boleta não existe no CRM, mas existe um a um dígito de "
+                "distância, no mesmo dia e com o mesmo valor. É mais provável que o "
+                "modelo tenha lido um dígito errado do que ser venda fora do sistema."
+            )
+            for item in suspeitas:
+                st.markdown(
+                    f"- {format_date_br(item.date)} · "
+                    f"{format_brl_currency(item.value_cents)} · {item.note}"
+                    + (f" · {item.product}" if item.product else "")
+                )
+    elif cross is not None:
+        st.info(
+            "Nenhuma boleta do período foi cruzada. Verifique as datas lidas nas boletas."
+        )
+
     st.subheader("Observações")
     st.caption("As sugestões abaixo usam apenas evidências dos arquivos e podem ser editadas.")
     edited_observations = st.data_editor(
@@ -426,7 +619,7 @@ if processed and processed.get("fingerprint") == current_fingerprint:
         value = edited_observations.iloc[index]["Observação"]
         observation_map[row.date] = "" if pd.isna(value) else str(value)
     try:
-        pdf_bytes = generate_pdf_report(report, observation_map)
+        pdf_bytes = generate_pdf_report(report, observation_map, crosscheck=cross)
         file_name = (
             f"conferencia_{company.lower()}_"
             f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pdf"

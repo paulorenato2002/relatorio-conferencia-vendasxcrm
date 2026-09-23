@@ -16,7 +16,12 @@ import re
 from typing import Sequence
 import unicodedata
 
-from src.formatters import format_brl_currency, parse_money_cents
+from src.formatters import (
+    barcode_to_crm_code,
+    format_brl_currency,
+    normalize_barcode,
+    parse_money_cents,
+)
 from src.models import Boleta, BoletaItem
 
 
@@ -51,17 +56,6 @@ def normalize_person(value: object) -> str | None:
     decomposed = unicodedata.normalize("NFKD", text)
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return re.sub(r"\s+", " ", stripped).upper() or None
-
-
-def normalize_barcode(value: object) -> str:
-    """Código da etiqueta em 10 dígitos, sem os zeros à esquerda do CRM."""
-    digits = re.sub(r"\D", "", str(value or ""))
-    return digits.lstrip("0") or digits
-
-
-def barcode_to_crm_code(barcode: str) -> str:
-    """Forma do CRM: 13 dígitos com zeros à esquerda."""
-    return re.sub(r"\D", "", barcode).zfill(13)
 
 
 def resolve_boleta_date(value: object, start: date, end: date) -> date | None:
@@ -238,6 +232,7 @@ def flag_date_outliers(boletas: Sequence[Boleta]) -> list[Boleta]:
                 continue
             result[index] = replace(
                 boleta,
+                date_suspect=True,
                 checks=boleta.checks
                 + (
                     f"data {boleta.date:%d/%m} aparece só nesta boleta; as outras "

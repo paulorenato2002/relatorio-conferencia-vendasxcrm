@@ -7,12 +7,13 @@ import openpyxl
 
 from src.config import companies_from_branches, companies_from_text
 from src.formatters import (
+    normalize_barcode,
     normalize_branch_code,
     normalize_identifier,
     parse_date_value,
     parse_money_cents,
 )
-from src.models import CrmData
+from src.models import CrmData, CrmItem
 from src.parsers.common import BinarySource, source_buffer, source_name
 
 
@@ -29,6 +30,13 @@ _ALIASES = {
         "base_calculo_comissao",
     },
     "branch": {"filial", "codigo_filial", "cod_filial"},
+    # Colunas usadas só no cruzamento com as boletas. Ausentes, a conferência
+    # de caixa continua funcionando: o cruzamento é que fica indisponível.
+    "code": {"codigo", "codigo_produto", "cod_produto", "ean"},
+    "gross": {"valor_bruto", "valor_bruto_item"},
+    "sale_number": {"nrovenda", "nro_venda", "numero_venda", "num_venda"},
+    "quantity": {"quantidade", "qtd", "qtde"},
+    "product": {"produto", "descricao", "descricao_produto"},
 }
 
 
@@ -57,6 +65,48 @@ def _find_table(workbook: openpyxl.Workbook):
     )
 
 
+def _cell(row, mapping: dict[str, int], field: str):
+    index = mapping.get(field)
+    if index is None or index >= len(row):
+        return None
+    return row[index]
+
+
+def _build_item(row, mapping: dict[str, int], day, seller: str) -> CrmItem | None:
+    """Monta a linha de produto usada no cruzamento com as boletas.
+
+    Devolve `None` quando a planilha não traz as colunas necessárias ou a linha
+    está incompleta. A ausência não invalida o registro: a conferência de caixa
+    usa apenas data, vendedora e base de comissão, que já foram lidas.
+    """
+    codigo = normalize_barcode(_cell(row, mapping, "code"))
+    if not codigo:
+        return None
+    try:
+        gross_cents = parse_money_cents(_cell(row, mapping, "gross"))
+    except ValueError:
+        return None
+    # Valor bruto negativo é devolução: o CRM lança a peça de volta com o sinal
+    # invertido. O sinal é preservado porque é ele que casa com o campo `trocas`
+    # da boleta; descartar essas linhas faria toda troca parecer venda sem
+    # registro no cruzamento.
+    if gross_cents == 0:
+        return None
+    try:
+        quantity = int(float(_cell(row, mapping, "quantity") or 1))
+    except (TypeError, ValueError):
+        quantity = 1
+    return CrmItem(
+        date=day,
+        seller=seller,
+        sale_number=str(_cell(row, mapping, "sale_number") or "").strip(),
+        codigo=codigo,
+        gross_cents=gross_cents,
+        quantity=max(1, quantity),
+        product=str(_cell(row, mapping, "product") or "").strip(),
+    )
+
+
 def parse_crm(source: BinarySource) -> CrmData:
     file_name = source_name(source, "CRM.xlsx")
     try:
@@ -68,6 +118,7 @@ def parse_crm(source: BinarySource) -> CrmData:
 
     _, rows, header_index, mapping = _find_table(workbook)
     daily: dict = defaultdict(lambda: defaultdict(int))
+    items: list[CrmItem] = []
     branches: set[str] = set()
     hints: list[str] = []
     record_count = 0
@@ -96,6 +147,9 @@ def parse_crm(source: BinarySource) -> CrmData:
             continue
         daily[day][seller] += value_cents
         record_count += 1
+        item = _build_item(row, mapping, day, seller)
+        if item is not None:
+            items.append(item)
         if "branch" in mapping and mapping["branch"] < len(row):
             branch = normalize_branch_code(row[mapping["branch"]])
             if branch:
@@ -122,5 +176,6 @@ def parse_crm(source: BinarySource) -> CrmData:
         branch_codes=branches,
         company_candidates=company_candidates,
         record_count=record_count,
+        items=tuple(items),
     )
 

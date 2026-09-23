@@ -41,8 +41,10 @@ Na tela:
 2. Envie o XLSX do CRM, o XLSX da Rede e os PDFs diários de fechamento recebidos.
 3. Clique em `Validar arquivos` e corrija qualquer erro bloqueante.
 4. Opcional: envie as boletas escaneadas e clique em `Ler boletas no n8n`.
-5. Clique em `Processar conferência`.
-6. Revise/edite as observações e baixe o PDF final.
+5. Confira o que foi lido, corrija na tabela o que estiver errado e clique em
+   `Aprovar boletas`. Sem essa aprovação a conferência não processa.
+6. Clique em `Processar conferência`.
+7. Revise/edite as observações e baixe o PDF final.
 
 ## Boletas escaneadas
 
@@ -73,6 +75,23 @@ soma das trocas         = DESCONTO
 
 Boleta que não fecha, ou que tem campo preenchido e ilegível, aparece na fila
 de revisão da tela em vez de entrar calada no relatório.
+
+**Correção e aprovação.** Apontar o problema sem deixar corrigir não resolve: o
+operador tem o papel na mão. A tela traz duas tabelas editáveis — uma de
+cabeçalhos (data, vendedora, totais, pagamento) e uma de peças (código de
+barras e valor, com linhas que podem ser acrescentadas ou removidas).
+
+A edição é aplicada sobre a transcrição crua e passa de novo por `build_boletas`,
+ou seja, pelas mesmas checagens da leitura automática. Corrigir um total para
+outro valor errado não silencia o alerta; corrigir a data faz a boleta voltar a
+ser comparada com as vizinhas. A conferência só processa depois de `Aprovar
+boletas`, e a aprovação cai sozinha se qualquer campo mudar depois.
+
+**Data fora do consenso.** A data é o único campo importante sem conferência
+possível dentro da própria boleta. Quando uma data aparece uma única vez no
+arquivo e outras três ou mais concordam em outro dia, a boleta é marcada e fica
+**fora do cruzamento** até ser corrigida — cruzá-la no dia errado produziria
+acusações de venda não registrada que são erro de leitura, não da loja.
 
 **Código de barras.** A etiqueta imprime 10 dígitos; o campo `codigo` do CRM
 guarda os mesmos dígitos com zeros à esquerda até 13. `barcode_to_crm_code()`

@@ -4,6 +4,30 @@ from dataclasses import dataclass, field
 from datetime import date
 
 
+@dataclass(frozen=True, slots=True)
+class CrmItem:
+    """Uma linha de produto do CRM.
+
+    `codigo` vem normalizado para os 10 dígitos que a etiqueta imprime, e
+    `gross_cents` é o `valor_bruto` — o preço de etiqueta, antes do desconto.
+    São esses dois campos que casam com o que está colado na boleta; o `valor`
+    líquido não serve para isso porque o desconto não aparece na peça.
+    """
+
+    date: date
+    seller: str
+    sale_number: str
+    codigo: str
+    gross_cents: int
+    quantity: int
+    product: str
+
+    @property
+    def is_return(self) -> bool:
+        """Devolução: o CRM lança a peça de volta com valor bruto negativo."""
+        return self.gross_cents < 0
+
+
 @dataclass(slots=True)
 class CrmData:
     file_name: str
@@ -13,9 +37,16 @@ class CrmData:
     branch_codes: set[str] = field(default_factory=set)
     company_candidates: set[str] = field(default_factory=set)
     record_count: int = 0
+    items: tuple[CrmItem, ...] = ()
 
     def total_on(self, day: date) -> int:
         return sum(self.daily_by_seller.get(day, {}).values())
+
+    def items_on(self, day: date) -> tuple[CrmItem, ...]:
+        return tuple(item for item in self.items if item.date == day)
+
+    def gross_on(self, day: date) -> int:
+        return sum(item.gross_cents * item.quantity for item in self.items if item.date == day)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +183,7 @@ class Boleta:
     flags: frozenset[str]
     unreadable_fields: tuple[str, ...]
     checks: tuple[str, ...]
+    date_suspect: bool = False
 
     @property
     def image_id(self) -> str:
