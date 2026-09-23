@@ -212,7 +212,7 @@ with st.container(border=True):
             help="Scans com várias boletas por página são recortados automaticamente.",
         )
 
-    validate_clicked = st.button("Validar arquivos", type="primary", use_container_width=True)
+    validate_clicked = st.button("Validar arquivos", type="primary", width="stretch")
 
 current_fingerprint = _fingerprint(company, start_date, end_date, crm_file, rede_file, cash_files)
 
@@ -310,7 +310,7 @@ if not boleta_files:
 else:
     read_clicked = st.button(
         "Ler boletas no n8n",
-        use_container_width=True,
+        width="stretch",
         disabled=boletas_are_current,
         help="Já lido: reenvie apenas se trocar os arquivos." if boletas_are_current else None,
     )
@@ -357,7 +357,7 @@ if boletas_are_current:
     cabecalhos_editados = st.data_editor(
         cabecalhos_lidos,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         disabled=["Boleta"],
         column_config={
             "Boleta": st.column_config.TextColumn("Arquivo", width="medium"),
@@ -429,7 +429,7 @@ if boletas_are_current:
                 "Aprovar sem corrigir é possível: as boletas seguem marcadas e o "
                 "cruzamento não conclui divergência em cima delas."
             )
-        if st.button(rotulo, type="primary", use_container_width=True):
+        if st.button(rotulo, type="primary", width="stretch"):
             st.session_state["boletas_aprovacao"] = assinatura
             st.rerun()
 
@@ -454,7 +454,7 @@ if boletas_are_current and not boletas_aprovadas:
 process_clicked = st.button(
     "Processar conferência",
     type="primary",
-    use_container_width=True,
+    width="stretch",
     disabled=not process_enabled,
 )
 
@@ -513,7 +513,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
 
     st.subheader("Conferência diária")
     daily_df = _daily_dataframe(report)
-    st.dataframe(daily_df, hide_index=True, use_container_width=True)
+    st.dataframe(daily_df, hide_index=True, width="stretch")
 
     cross = processed.get("crosscheck")
     if cross is not None and cross.rows:
@@ -560,7 +560,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
             )
 
         st.dataframe(
-            _crosscheck_dataframe(cross), hide_index=True, use_container_width=True
+            _crosscheck_dataframe(cross), hide_index=True, width="stretch"
         )
 
         sem_crm = cross.by_kind(KIND_MISSING_IN_CRM)
@@ -571,7 +571,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
                 "Confirme a peça na boleta física antes de tratar como não registrada."
             )
             st.dataframe(
-                _discrepancy_dataframe(sem_crm), hide_index=True, use_container_width=True
+                _discrepancy_dataframe(sem_crm), hide_index=True, width="stretch"
             )
 
         sem_boleta = cross.by_kind(KIND_MISSING_IN_BOLETA)
@@ -581,7 +581,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
             st.dataframe(
                 _discrepancy_dataframe(sem_boleta),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
         suspeitas = cross.by_kind(KIND_SUSPECT_READ)
@@ -608,7 +608,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
     edited_observations = st.data_editor(
         st.session_state["observations"],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         disabled=["Data", "Status"],
         column_config={"Observação": st.column_config.TextColumn(width="large")},
         key="observations_editor",
@@ -630,7 +630,7 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
             file_name=file_name,
             mime="application/pdf",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
     except Exception as exc:
         st.error(f"Não foi possível gerar o PDF final: {exc}")
