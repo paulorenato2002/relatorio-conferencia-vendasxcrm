@@ -2,7 +2,14 @@
 
 Aplicação local em Python/Streamlit para conferir, por dia, as vendas do CRM Morana, os valores de PIX e dinheiro dos fechamentos de caixa e as vendas de cartão aprovadas na Rede.
 
-Todo o processamento ocorre em memória durante a sessão do Streamlit. A aplicação não usa banco de dados, autenticação, API externa ou inteligência artificial, e não grava os uploads.
+Todo o processamento ocorre em memória durante a sessão do Streamlit. A aplicação não usa banco de dados nem autenticação, e não grava os uploads.
+
+**Exceção: as boletas escaneadas.** Elas são manuscritas, então a leitura é
+feita por um modelo de visão, através de um workflow no n8n. Quando essa etapa
+é acionada, as imagens das boletas saem da máquina: vão para o n8n Cloud e de
+lá para a OpenAI. Nenhum outro arquivo do fluxo sai daqui, e a etapa só roda
+quando o operador clica em `Ler boletas no n8n` — enviar boletas na tela não
+dispara nada sozinho. Detalhes em [`n8n/README.md`](n8n/README.md).
 
 Planilhas e PDFs operacionais não são versionados. Cada usuário fornece seus
 arquivos diretamente na interface durante a sessão.
@@ -33,8 +40,66 @@ Na tela:
 1. Selecione `Rezende` ou `L2H` e informe o período exato.
 2. Envie o XLSX do CRM, o XLSX da Rede e os PDFs diários de fechamento recebidos.
 3. Clique em `Validar arquivos` e corrija qualquer erro bloqueante.
-4. Clique em `Processar conferência`.
-5. Revise/edite as observações e baixe o PDF final.
+4. Opcional: envie as boletas escaneadas e clique em `Ler boletas no n8n`.
+5. Confira o que foi lido, corrija na tabela o que estiver errado e clique em
+   `Aprovar boletas`. Sem essa aprovação a conferência não processa.
+6. Clique em `Processar conferência`.
+7. Revise/edite as observações e baixe o PDF final.
+
+## Boletas escaneadas
+
+As boletas são o registro manuscrito do balcão. Configuração do n8n em
+[`n8n/README.md`](n8n/README.md); a URL e o token do webhook vão no `.env`
+(modelo em `.env.example`).
+
+O caminho é: recortar uma boleta por imagem (`src/boletas/render.py`), mandar
+para o n8n (`src/boletas/client.py`), conferir a boleta contra ela mesma e
+converter para os tipos do projeto (`src/boletas/schema.py`).
+
+**Recorte.** Os scans trazem de duas a três boletas lado a lado. O recorte usa
+projeção de coluna — boletas são separadas por faixas verticais sem tinta — e
+não envolve aprendizado de máquina. O menor lado do recorte é limitado a 768px,
+que é onde o serviço de visão corta de qualquer forma: enviar mais é banda
+gasta em pixels descartados.
+
+**Auto-conferência.** O modelo é proibido de calcular: campo em branco no papel
+volta como `null`, mesmo quando daria para somar. Isso é o que permite conferir
+a leitura depois, no Python:
+
+```text
+soma dos itens          = SUB TOTAL
+SUB TOTAL - DESCONTO    = TOTAL
+quantidade de itens     = Nº PEÇAS
+soma das trocas         = DESCONTO
+```
+
+Boleta que não fecha, ou que tem campo preenchido e ilegível, aparece na fila
+de revisão da tela em vez de entrar calada no relatório.
+
+**Correção e aprovação.** Apontar o problema sem deixar corrigir não resolve: o
+operador tem o papel na mão. A tela traz duas tabelas editáveis — uma de
+cabeçalhos (data, vendedora, totais, pagamento) e uma de peças (código de
+barras e valor, com linhas que podem ser acrescentadas ou removidas).
+
+A edição é aplicada sobre a transcrição crua e passa de novo por `build_boletas`,
+ou seja, pelas mesmas checagens da leitura automática. Corrigir um total para
+outro valor errado não silencia o alerta; corrigir a data faz a boleta voltar a
+ser comparada com as vizinhas. A conferência só processa depois de `Aprovar
+boletas`, e a aprovação cai sozinha se qualquer campo mudar depois.
+
+**Data fora do consenso.** A data é o único campo importante sem conferência
+possível dentro da própria boleta. Quando uma data aparece uma única vez no
+arquivo e outras três ou mais concordam em outro dia, a boleta é marcada e fica
+**fora do cruzamento** até ser corrigida — cruzá-la no dia errado produziria
+acusações de venda não registrada que são erro de leitura, não da loja.
+
+**Código de barras.** A etiqueta imprime 10 dígitos; o campo `codigo` do CRM
+guarda os mesmos dígitos com zeros à esquerda até 13. `barcode_to_crm_code()`
+faz a conversão, que é o que liga a peça da boleta à linha do CRM.
+
+**Custo.** A leitura é a única etapa paga e roda só no clique. O resultado fica
+em cache pelos arquivos enviados: trocar empresa ou período reaproveita a
+transcrição, sem reenviar as imagens.
 
 ## Regra de cálculo
 

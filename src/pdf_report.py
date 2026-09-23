@@ -252,6 +252,200 @@ def _daily_table(report: ReconciliationReport, styles) -> Table:
     return table
 
 
+_CROSSCHECK_COLORS = {
+    "OK": (GREEN, GREEN_BG),
+    "DIVERGÊNCIA": (RED, RED_BG),
+    "REVISAR": (ORANGE, ORANGE_BG),
+    "SEM BOLETA": (SLATE, LIGHT),
+}
+
+
+def _crosscheck_daily_table(crosscheck, styles) -> Table:
+    headers = [
+        "Data", "Bol.", "Fora do<br/>cruzam.", "Peças<br/>casadas",
+        "Só na<br/>boleta", "Só no<br/>CRM", "Leitura<br/>suspeita",
+        "Bruto<br/>boletas", "Bruto CRM", "Status",
+    ]
+    data = [[Paragraph(header, styles["table_header"]) for header in headers]]
+    for row in crosscheck.rows:
+        data.append(
+            [
+                Paragraph(format_date_br(row.date), styles["center"]),
+                Paragraph(str(row.boleta_count), styles["center"]),
+                Paragraph(str(row.excluded_boletas), styles["center"]),
+                Paragraph(str(row.matched_items), styles["center"]),
+                Paragraph(str(row.only_boleta), styles["center"]),
+                Paragraph(str(row.only_crm), styles["center"]),
+                Paragraph(str(row.suspect_reads), styles["center"]),
+                Paragraph(format_brl_cents(row.boleta_gross_cents), styles["right"]),
+                Paragraph(format_brl_cents(row.crm_gross_cents), styles["right"]),
+                Paragraph(row.status, styles["center"]),
+            ]
+        )
+    widths = [19 * mm, 13 * mm, 16 * mm, 16 * mm, 15 * mm, 15 * mm, 17 * mm, 21 * mm, 21 * mm, 25 * mm]
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    for index, row in enumerate(crosscheck.rows, 1):
+        color, background = _CROSSCHECK_COLORS.get(row.status, (SLATE, LIGHT))
+        commands.extend(
+            [
+                ("BACKGROUND", (-1, index), (-1, index), background),
+                ("TEXTCOLOR", (-1, index), (-1, index), color),
+            ]
+        )
+    table.setStyle(TableStyle(commands))
+    return table
+
+
+def _discrepancy_table(items, styles) -> Table:
+    headers = ["Data", "Código", "Valor", "Tipo", "Vendedora", "Boleta", "Venda CRM", "Produto"]
+    data = [[Paragraph(header, styles["table_header"]) for header in headers]]
+    for item in items:
+        data.append(
+            [
+                Paragraph(format_date_br(item.date), styles["center"]),
+                Paragraph(escape(item.codigo), styles["center"]),
+                Paragraph(format_brl_cents(item.value_cents), styles["right"]),
+                Paragraph("Devolução" if item.is_return else "Venda", styles["center"]),
+                Paragraph(escape(item.seller or "-"), styles["small"]),
+                Paragraph(escape(item.boleta_numero or "-"), styles["center"]),
+                Paragraph(escape(item.sale_number or "-"), styles["center"]),
+                Paragraph(escape((item.product or "-")[:38]), styles["small"]),
+            ]
+        )
+    widths = [20 * mm, 24 * mm, 20 * mm, 20 * mm, 22 * mm, 16 * mm, 19 * mm, 37 * mm]
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return table
+
+
+def _crosscheck_section(crosscheck, styles):
+    """Seção do cruzamento peça a peça entre boletas e CRM."""
+    from src.crosscheck import (
+        KIND_MISSING_IN_BOLETA,
+        KIND_MISSING_IN_CRM,
+        KIND_SUSPECT_READ,
+    )
+
+    flowables = [
+        Paragraph("Cruzamento boletas × CRM", styles["section"]),
+        Paragraph(
+            "Comparação peça a peça pelo código de barras da etiqueta, que é o mesmo "
+            "código do CRM sem os zeros à esquerda. Dias sem boleta enviada não são "
+            "cruzados e aparecem como SEM BOLETA.",
+            styles["small"],
+        ),
+        Spacer(1, 3 * mm),
+        Table(
+            [[
+                Paragraph(f"<b>Peças casadas:</b> {crosscheck.totals['matched_items']}", styles["body"]),
+                Paragraph(f"<b>Na boleta, fora do CRM:</b> {crosscheck.totals['only_boleta']}", styles["body"]),
+                Paragraph(f"<b>No CRM, fora da boleta:</b> {crosscheck.totals['only_crm']}", styles["body"]),
+                Paragraph(f"<b>Leitura suspeita:</b> {crosscheck.totals['suspect_reads']}", styles["body"]),
+            ]],
+            colWidths=[38 * mm, 50 * mm, 50 * mm, 40 * mm],
+            style=TableStyle(
+                [
+                    ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]
+            ),
+        ),
+        Spacer(1, 4 * mm),
+        _crosscheck_daily_table(crosscheck, styles),
+    ]
+
+    if crosscheck.totals.get("excluded_boletas"):
+        flowables.extend(
+            [
+                Spacer(1, 2 * mm),
+                Paragraph(
+                    f"{crosscheck.totals['excluded_boletas']} boleta(s) ficaram fora do "
+                    "cruzamento por terem data sob suspeita. Enquanto a data nao for "
+                    "corrigida, as pecas dessas boletas constam abaixo como \"no CRM, "
+                    "fora da boleta\" e nao devem ser lidas como venda sem registro.",
+                    styles["small"],
+                ),
+            ]
+        )
+
+    blocos = [
+        (
+            KIND_MISSING_IN_CRM,
+            "Peças na boleta e fora do CRM",
+            "Venda registrada no papel sem linha correspondente no sistema. Confirmar "
+            "a peça na boleta física antes de tratar como venda não registrada.",
+        ),
+        (
+            KIND_MISSING_IN_BOLETA,
+            "Peças no CRM e fora das boletas",
+            "Venda no sistema sem peça correspondente entre as boletas enviadas.",
+        ),
+    ]
+    for kind, titulo, nota in blocos:
+        items = crosscheck.by_kind(kind)
+        if not items:
+            continue
+        flowables.extend(
+            [
+                Spacer(1, 5 * mm),
+                Paragraph(titulo, styles["section"]),
+                Paragraph(nota, styles["small"]),
+                Spacer(1, 2 * mm),
+                _discrepancy_table(items, styles),
+            ]
+        )
+
+    suspeitas = crosscheck.by_kind(KIND_SUSPECT_READ)
+    if suspeitas:
+        flowables.extend(
+            [
+                Spacer(1, 5 * mm),
+                Paragraph("Prováveis erros de leitura", styles["section"]),
+                Paragraph(
+                    "O código lido na boleta não existe no CRM, mas existe um a um "
+                    "dígito de distância, no mesmo dia e com o mesmo valor. É mais "
+                    "provável erro de transcrição do que venda fora do sistema; estas "
+                    "peças não foram contadas como divergência.",
+                    styles["small"],
+                ),
+                Spacer(1, 2 * mm),
+            ]
+        )
+        for item in suspeitas:
+            flowables.append(
+                Paragraph(
+                    f"{format_date_br(item.date)} &middot; "
+                    f"{format_brl_currency(item.value_cents)} &middot; {escape(item.note)}"
+                    + (f" &middot; {escape(item.product)}" if item.product else ""),
+                    styles["small"],
+                )
+            )
+    return flowables
+
+
 def _seller_tables(report: ReconciliationReport, styles):
     sellers = list(report.sellers)
     chunks = [sellers[index : index + 5] for index in range(0, len(sellers), 5)]
@@ -307,6 +501,7 @@ def generate_pdf_report(
     report: ReconciliationReport,
     observations: dict[date, str] | None = None,
     issued_at: datetime | None = None,
+    crosscheck=None,
 ) -> bytes:
     observations = observations or {}
     issued_at = issued_at or datetime.now(ZoneInfo("America/Sao_Paulo"))
@@ -384,6 +579,11 @@ def generate_pdf_report(
         Paragraph("Conferência diária", styles["section"]),
         _daily_table(report, styles),
     ]
+
+    if crosscheck is not None and crosscheck.rows:
+        story.append(PageBreak())
+        story.append(Spacer(1, 5 * mm))
+        story.extend(_crosscheck_section(crosscheck, styles))
 
     if report.sellers:
         story.append(PageBreak())

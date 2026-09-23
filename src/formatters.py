@@ -42,6 +42,21 @@ def normalize_branch_code(value: object) -> str:
     return digits.zfill(5) if digits and len(digits) <= 5 else digits
 
 
+def normalize_barcode(value: object) -> str:
+    """Código da peça nos 10 dígitos que a etiqueta imprime.
+
+    O CRM guarda os mesmos dígitos preenchidos com zeros à esquerda até 13.
+    Tirar os zeros é o que liga a etiqueta colada na boleta à linha do CRM.
+    """
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits.lstrip("0") or digits
+
+
+def barcode_to_crm_code(barcode: str) -> str:
+    """Caminho inverso: 13 dígitos com zeros à esquerda, a forma do CRM."""
+    return re.sub(r"\D", "", barcode).zfill(13)
+
+
 def parse_date_value(value: object) -> date:
     if isinstance(value, datetime):
         return value.date()
