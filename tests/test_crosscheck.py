@@ -134,7 +134,27 @@ def test_codigo_a_um_digito_do_crm_e_erro_de_leitura_nao_venda_faltando():
     suspeitas = relatorio.by_kind(KIND_SUSPECT_READ)
     assert len(suspeitas) == 1
     assert "3698637912" in suspeitas[0].note and "3698637992" in suspeitas[0].note
-    assert relatorio.rows[0].status == STATUS_REVIEW
+    # Resolvida como a mesma peça: não sobra divergência para o dia.
+    assert relatorio.rows[0].status == STATUS_OK
+    assert relatorio.rows[0].suspect_reads == 1
+
+
+def test_leitura_suspeita_nao_mascara_divergencia_real_no_mesmo_dia():
+    relatorio = crosscheck(
+        *PERIODO,
+        crm_data(crm_item("2707569661", 5990), crm_item("3698637992", 5990)),
+        lote(boleta(
+            itens=[
+                {"codigo": "2707569661", "valor": "59.90", "manuscrito": False},
+                {"codigo": "3698637912", "valor": "59.90", "manuscrito": False},
+                {"codigo": "9999999999", "valor": "89.90", "manuscrito": False},
+            ],
+            total="209.70", num_pecas=3,
+        )),
+    )
+    assert len(relatorio.by_kind(KIND_SUSPECT_READ)) == 1
+    assert len(relatorio.by_kind(KIND_MISSING_IN_CRM)) == 1
+    assert relatorio.rows[0].status == STATUS_DIVERGENT
 
 
 def test_codigo_parecido_mas_de_valor_diferente_nao_e_tratado_como_erro():
@@ -206,16 +226,29 @@ def test_dia_sem_boleta_nao_e_divergencia():
     assert relatorio.days_divergent == 0
 
 
-def test_boleta_em_revisao_impede_veredito_de_divergencia():
-    # Com a leitura sob suspeita, a divergência pode ser nossa e não da loja.
-    # Mandar investigar seria mandar alguém atrás de erro do sistema.
+def test_duvida_nas_pecas_impede_veredito_de_divergencia():
+    # Nº PEÇAS diferente da quantidade lida: pode faltar etiqueta lida, e a
+    # divergência pode ser nossa e não da loja.
+    relatorio = crosscheck(
+        *PERIODO,
+        crm_data(crm_item("2707569661", 5990)),
+        lote(boleta(num_pecas=3)),
+    )
+    assert relatorio.rows[0].status == STATUS_REVIEW
+
+
+def test_total_manuscrito_errado_nao_mascara_peca_divergente():
+    # O cruzamento compara etiquetas impressas. Um total que não fecha é
+    # problema da boleta, não das peças: a peça fora do CRM continua sendo
+    # divergência. Na primeira versão isto virava REVISAR, e no lote de
+    # setembro/2026 os 22 dias saíam REVISAR.
     relatorio = crosscheck(
         *PERIODO,
         crm_data(crm_item("2707569661", 5990)),
         lote(boleta(total="200.00")),
     )
     assert relatorio.rows[0].review_boletas == 1
-    assert relatorio.rows[0].status == STATUS_REVIEW
+    assert relatorio.rows[0].status == STATUS_DIVERGENT
 
 
 def test_boleta_fora_do_periodo_e_ignorada():
@@ -294,7 +327,8 @@ def test_bruto_da_boleta_excluida_nao_entra_no_total_do_dia():
 
 def test_boleta_em_revisao_por_outro_motivo_continua_sendo_cruzada():
     # Só a data desloca o balde. Total divergente não impede o casamento das
-    # peças, que é justamente o que ajuda a explicar o total.
+    # peças; com todas casadas, o dia fecha — o total fica na fila de revisão
+    # das boletas, antes do processamento.
     relatorio = crosscheck(
         *PERIODO,
         crm_data(crm_item("2707569661", 5990), crm_item("3698637992", 5990)),
@@ -302,4 +336,31 @@ def test_boleta_em_revisao_por_outro_motivo_continua_sendo_cruzada():
     )
     assert relatorio.rows[0].matched_items == 2
     assert relatorio.rows[0].excluded_boletas == 0
-    assert relatorio.rows[0].status == STATUS_REVIEW
+    assert relatorio.rows[0].status == STATUS_OK
+
+
+def test_codigo_com_um_digito_a_menos_e_erro_de_leitura():
+    # Lote de setembro/2026: 58 códigos lidos com 9 dígitos, nenhum no CRM,
+    # onde todos têm 10. O modelo come um dígito da etiqueta.
+    relatorio = crosscheck(
+        *PERIODO,
+        crm_data(crm_item("2707569661", 5990), crm_item("3698637992", 5990)),
+        lote(boleta(itens=[
+            {"codigo": "2707569661", "valor": "59.90", "manuscrito": False},
+            {"codigo": "369863792", "valor": "59.90", "manuscrito": False},
+        ])),
+    )
+    assert relatorio.by_kind(KIND_MISSING_IN_CRM) == []
+    assert len(relatorio.by_kind(KIND_SUSPECT_READ)) == 1
+
+
+def test_codigo_com_dois_digitos_a_menos_nao_e_tratado_como_erro_de_leitura():
+    relatorio = crosscheck(
+        *PERIODO,
+        crm_data(crm_item("2707569661", 5990), crm_item("3698637992", 5990)),
+        lote(boleta(itens=[
+            {"codigo": "2707569661", "valor": "59.90", "manuscrito": False},
+            {"codigo": "36986379", "valor": "59.90", "manuscrito": False},
+        ])),
+    )
+    assert relatorio.by_kind(KIND_SUSPECT_READ) == []

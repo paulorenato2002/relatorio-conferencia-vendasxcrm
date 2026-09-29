@@ -266,3 +266,83 @@ def test_progresso_termina_em_100_por_cento(n8n, cache):
     assert snap.progress == 1.0
     assert snap.total_pages == 2 and snap.pages_done == 2
     assert snap.estimated_total == 4
+
+
+# --- robustez do cache (bugs achados na leitura real de um mês) --------------
+
+
+def test_gravacao_que_falha_no_disco_nao_perde_a_boleta(n8n, cache, monkeypatch):
+    # Na leitura real, um `os.replace` negado pelo Windows escapou do callback
+    # e a boleta — lida e paga — sumiu: nem resultado, nem falha.
+    original = cache.put
+    def put_que_falha(digest, page, position, payload):
+        if (page, position) == (1, 2):
+            raise PermissionError(5, "Acesso negado")
+        return original(digest, page, position, payload)
+    monkeypatch.setattr(cache, "put", put_que_falha)
+
+    job = rodar([UploadedBatchFile("a.pdf", pdf([3], 1))], n8n.config(), cache)
+    snap = job.snapshot()
+    assert snap.done == 3 and snap.failed == 0, "a boleta lida precisa entrar no resultado"
+    assert len(job.results()) == 3
+    assert any("não foi possível guardar" in w for w in snap.warnings)
+
+
+def test_boleta_nao_guardada_e_lida_de_novo_na_proxima_vez(n8n, cache, monkeypatch):
+    # Quem garante é a conferência de contagem do cache: o arquivo pode até
+    # ficar marcado como completo, mas com uma leitura a menos não é aceito.
+    original = cache.put
+    def put_que_falha(digest, page, position, payload):
+        if (page, position) == (1, 2):
+            raise PermissionError(5, "Acesso negado")
+        return original(digest, page, position, payload)
+    monkeypatch.setattr(cache, "put", put_que_falha)
+    files = [UploadedBatchFile("a.pdf", pdf([3], 1))]
+    rodar(files, n8n.config(), cache)
+
+    monkeypatch.setattr(cache, "put", original)
+    n8n.requests.clear()
+    rodar(files, n8n.config(), cache)
+    assert n8n.requests == ["a.pdf#p1b2"]
+
+
+def test_marca_de_completo_com_buraco_e_reparada(n8n, cache):
+    # Marcas gravadas antes da conferência de contagem podem ter buraco: o
+    # arquivo é recortado de novo e só o que falta é lido.
+    from src.boletas.render import file_hash
+
+    conteudo = pdf([3], 1)
+    files = [UploadedBatchFile("a.pdf", conteudo)]
+    rodar(files, n8n.config(), cache)
+    digest = file_hash(conteudo)
+    entrada = cache._load(digest)
+    del entrada["boletas"]["p1b3"]
+    entrada.pop("count")            # como gravava a versão anterior
+    cache._save(digest, entrada)
+    cache._loaded.clear()
+
+    n8n.requests.clear()
+    job = rodar(files, n8n.config(), cache)
+    assert n8n.requests == ["a.pdf#p1b3"]
+    assert job.snapshot().done == 3
+
+
+def test_substituicao_negada_pelo_windows_e_retentada(cache, monkeypatch):
+    import os
+
+    import src.boletas.cache as cache_module
+
+    tentativas = {"n": 0}
+    replace_original = os.replace
+    def replace_instavel(origem, destino):
+        tentativas["n"] += 1
+        if tentativas["n"] <= 2:
+            raise PermissionError(5, "Acesso negado")
+        return replace_original(origem, destino)
+    monkeypatch.setattr(cache_module.os, "replace", replace_instavel)
+    monkeypatch.setattr(cache_module, "_REPLACE_WAIT", 0.001)
+
+    cache.put("abc", 1, 1, {"numero": "1"})
+    cache._loaded.clear()
+    assert cache.get("abc", 1, 1) == {"numero": "1"}
+    assert tentativas["n"] == 3

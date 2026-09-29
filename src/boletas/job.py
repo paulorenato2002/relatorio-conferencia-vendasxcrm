@@ -144,6 +144,7 @@ class LeituraJob:
         self._pending: dict[str, int] = {}
         self._rendered: set[str] = set()
         self._file_failed: set[str] = set()
+        self._found_by_file: dict[str, int] = {}
 
     # --- controle -----------------------------------------------------------
 
@@ -236,8 +237,14 @@ class LeituraJob:
                 and digest not in self._file_failed
                 and not self._cancel.is_set()
             )
+            count = self._found_by_file.get(digest, 0)
         if ready:
-            self.cache.mark_complete(digest)
+            try:
+                self.cache.mark_complete(digest, count)
+            except OSError:
+                # Sem a marca o arquivo só é recortado de novo na próxima vez;
+                # as leituras já guardadas continuam sendo aproveitadas.
+                pass
 
     def _run(self) -> None:
         try:
@@ -318,6 +325,7 @@ class LeituraJob:
                     last_page = image.page
                 with self._lock:
                     self._found += 1
+                    self._found_by_file[digest] = self._found_by_file.get(digest, 0) + 1
 
                 cached = self.cache.get(digest, image.page, image.position)
                 if cached is not None:
@@ -347,22 +355,39 @@ class LeituraJob:
             self._maybe_complete(digest)
 
     def _on_read(self, future: Future, order, name, digest, image, in_flight) -> None:
+        # Tudo aqui dentro precisa estar protegido: exceção que escapa de um
+        # callback de Future é engolida pelo executor. Foi assim que, na leitura
+        # real de um mês, uma boleta lida e paga sumiu — nem resultado nem falha.
         try:
-            raw = future.result()
-        except BoletaClientError as exc:
-            with self._lock:
-                self._failed += 1
-                self._file_failed.add(digest)
-                if not self._cancel.is_set():
-                    self._warnings.append(str(exc))
-        except Exception as exc:  # pragma: no cover - erro inesperado de rede
-            with self._lock:
-                self._failed += 1
-                self._file_failed.add(digest)
-                self._warnings.append(f"{image.image_id}: {type(exc).__name__}: {exc}")
-        else:
-            self.cache.put(digest, image.page, image.position, raw.payload)
+            try:
+                raw = future.result()
+            except BoletaClientError as exc:
+                with self._lock:
+                    self._failed += 1
+                    self._file_failed.add(digest)
+                    if not self._cancel.is_set():
+                        self._warnings.append(str(exc))
+                return
+            except Exception as exc:  # pragma: no cover - erro inesperado de rede
+                with self._lock:
+                    self._failed += 1
+                    self._file_failed.add(digest)
+                    self._warnings.append(f"{image.image_id}: {type(exc).__name__}: {exc}")
+                return
+
+            # Primeiro na memória: a leitura foi feita e paga, e vale para este
+            # relatório mesmo que o disco falhe.
             self._record(order, raw, cached=False)
+            try:
+                self.cache.put(digest, image.page, image.position, raw.payload)
+            except OSError as exc:
+                # Não precisa bloquear a marca de completo: o cache confere a
+                # contagem na volta e relê o que faltar.
+                with self._lock:
+                    self._warnings.append(
+                        f"{image.image_id}: lida, mas não foi possível guardar a leitura "
+                        f"({exc}). Vale para este relatório; numa próxima vez será lida de novo."
+                    )
         finally:
             in_flight.release()
             with self._lock:

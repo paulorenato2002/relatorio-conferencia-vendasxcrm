@@ -203,11 +203,36 @@ def test_campo_ilegivel_marca_a_boleta_para_revisao():
     assert boleta.needs_review is True
 
 
-def test_codigo_fora_do_padrao_de_10_digitos_e_sinalizado():
+def test_codigo_fora_do_padrao_nao_manda_a_boleta_para_revisao():
+    # Não há o que corrigir na tela — código de barras não é editável — e o
+    # cruzamento reconhece o código a um dígito de distância do CRM. No lote de
+    # setembro/2026 este alerta punha 64 boletas em revisão sem ação possível.
     boleta = _build(
         _boleta(itens=[{"codigo": "252044", "valor": "129.70", "manuscrito": False}], num_pecas=1)
     )
-    assert any("dígitos" in check for check in boleta.checks)
+    assert not any("dígitos" in check for check in boleta.checks)
+    assert boleta.items[0].codigo == "252044"
+
+
+def test_texto_null_do_modelo_e_tratado_como_vazio():
+    # O modelo às vezes devolve o texto "null" no lugar do nulo do JSON; 3
+    # boletas do lote de setembro/2026 eram descartadas por isso.
+    boleta = _build(_boleta(sub_total="null", desconto="null", num_pecas="null"))
+    assert boleta.sub_total_cents is None
+    assert boleta.discount_cents is None
+    assert boleta.piece_count is None
+
+
+@pytest.mark.parametrize("ajuste,incerto", [
+    ({}, False),
+    ({"total": "200.00"}, False),
+    ({"cliente": None, "campos_ilegiveis": ["cliente"]}, False),
+    ({"num_pecas": 5}, True),
+    ({"itens": []}, True),
+    ({"itens": [{"codigo": "2520441552", "valor": None, "manuscrito": False}]}, True),
+])
+def test_duvida_nas_pecas_so_quando_afeta_as_pecas(ajuste, incerto):
+    assert _build(_boleta(**ajuste)).items_uncertain is incerto
 
 
 def test_boleta_sem_total_vai_para_revisao():
@@ -233,7 +258,9 @@ def test_agregacao_por_dia_e_vendedora():
     assert data.total_on(date(2026, 9, 22)) == 27_450
 
 
-def test_boleta_invalida_vira_aviso_e_nao_derruba_o_lote():
+def test_data_ininteligivel_nao_derruba_a_boleta():
+    # Antes a boleta inteira sumia do relatório. No lote de setembro/2026 foram
+    # 208 de 783 — por um formato de data que o parser não conhecia.
     data = build_boletas(
         [
             RawBoleta("carla.pdf", 1, 1, _boleta()),
@@ -241,9 +268,146 @@ def test_boleta_invalida_vira_aviso_e_nao_derruba_o_lote():
         ],
         *PERIODO,
     )
+    assert len(data.boletas) == 2
+    sem_data = data.boletas[1]
+    assert sem_data.date is None
+    assert any("não pôde ser interpretada" in c for c in sem_data.checks)
+
+
+def test_payload_estruturalmente_invalido_vira_aviso_e_nao_derruba_o_lote():
+    data = build_boletas(
+        [
+            RawBoleta("carla.pdf", 1, 1, _boleta()),
+            RawBoleta("carla.pdf", 1, 2, _boleta(itens="não é lista")),
+        ],
+        *PERIODO,
+    )
     assert len(data.boletas) == 1
     assert len(data.warnings) == 1
     assert "carla.pdf#p1b2" in data.warnings[0]
+
+
+# --- datas como as vendedoras escrevem -----------------------------------------
+
+
+@pytest.mark.parametrize("escrito", [
+    "05/SET", "05/set", "05 SET", "5 SET", "05 SET.", "05/SET.", "05 SET. 2026",
+    "05 SET 2026", "05 SET, 2026", "05/SET.2026", "5 de setembro", "05/09", "5/9",
+])
+def test_data_com_mes_por_extenso(escrito):
+    assert resolve_boleta_date(escrito, *PERIODO) == date(2026, 9, 5)
+
+
+def test_dia_sozinho_usa_o_mes_do_arquivo():
+    inicio, fim = date(2026, 8, 20), date(2026, 9, 27)
+    assert resolve_boleta_date("30", inicio, fim, month_hint=8) == date(2026, 8, 30)
+
+
+def test_dia_sozinho_sem_mes_conhecido_e_ininteligivel():
+    with pytest.raises(BoletaSchemaError):
+        resolve_boleta_date("30", date(2026, 8, 20), date(2026, 9, 27))
+
+
+# --- data pelo nome do arquivo -------------------------------------------------
+
+
+def _com_arquivo(nome, **overrides):
+    return build_boleta(
+        _boleta(**overrides), source_file=nome, page=1, position=1,
+        start=PERIODO[0], end=PERIODO[1],
+    )
+
+
+@pytest.mark.parametrize("nome,esperado", [
+    ("Boletas Leide 05.09.pdf", date(2026, 9, 5)),
+    ("boletas Daniely 01.09.pdf", date(2026, 9, 1)),
+    ("Boletas Jaiza 21.09 (1).pdf", date(2026, 9, 21)),
+    ("boleta carla (65).pdf", None),
+    ("Boletas 31.09.pdf", None),
+])
+def test_data_no_nome_do_arquivo(nome, esperado):
+    from src.boletas.schema import date_from_filename
+
+    assert date_from_filename(nome, *PERIODO) == esperado
+
+
+def test_data_em_branco_e_coberta_pelo_nome_do_arquivo():
+    boleta = _com_arquivo("Boletas Leide 05.09.pdf", data=None, campos_ilegiveis=["data"])
+    assert boleta.date == date(2026, 9, 5)
+    assert boleta.date_source == "arquivo"
+    assert "data" not in boleta.unreadable_fields
+    assert boleta.checks == ()
+
+
+def test_data_divergente_do_arquivo_usa_a_do_arquivo_e_avisa():
+    # Caso típico medido: "1 SET" num arquivo de 21/09 — o modelo comeu o "2".
+    boleta = _com_arquivo("Boletas Daniely 21.09.pdf", data="1 SET")
+    assert boleta.date == date(2026, 9, 21)
+    assert any("a boleta diz 01/09, o arquivo é de 21/09" in c for c in boleta.checks)
+    assert boleta.date_suspect is False, "o dia do arquivo é confiável; não sai do cruzamento"
+
+
+def test_data_digitada_na_tela_vale_mais_que_o_arquivo():
+    boleta = _com_arquivo("Boletas Daniely 18.09.pdf", data="12/09", data_confirmada=True)
+    assert boleta.date == date(2026, 9, 12)
+    assert boleta.date_source == "confirmada"
+    assert boleta.checks == ()
+
+
+def test_consenso_entre_vizinhas_nao_se_aplica_a_arquivo_datado():
+    data = build_boletas(
+        [RawBoleta("Boletas Leide 05.09.pdf", 1, i, _boleta()) for i in range(1, 5)]
+        + [RawBoleta("Boletas Leide 05.09.pdf", 1, 5, _boleta(data="12/09", data_confirmada=True))],
+        *PERIODO,
+    )
+    assert not any(b.date_suspect for b in data.boletas)
+
+
+# --- desconto em porcentagem --------------------------------------------------
+
+
+def test_desconto_em_porcentagem_sobre_o_sub_total():
+    # 48 boletas do lote de setembro/2026 traziam o desconto assim. Tratado como
+    # dinheiro, "10%" virava R$ 10,00 sem aviso.
+    boleta = _build(_boleta(
+        itens=[{"codigo": "2707569661", "valor": "124.80", "manuscrito": False}],
+        num_pecas=1, sub_total="124.80", desconto="10%", total="112.32",
+    ))
+    assert boleta.discount_cents == 1248
+    assert boleta.checks == ()
+
+
+def test_desconto_em_porcentagem_sem_sub_total_usa_a_soma_dos_itens():
+    boleta = _build(_boleta(
+        itens=[{"codigo": "2707569661", "valor": "204.80", "manuscrito": False}],
+        num_pecas=1, sub_total=None, desconto="15%", total="174.08",
+    ))
+    assert boleta.discount_cents == 3072
+    assert boleta.checks == ()
+
+
+def test_desconto_em_porcentagem_tolera_um_centavo_de_arredondamento():
+    boleta = _build(_boleta(
+        itens=[{"codigo": "2707569661", "valor": "299.70", "manuscrito": False}],
+        num_pecas=1, sub_total="299.70", desconto="10%", total="269.74",
+    ))
+    assert boleta.checks == ()
+
+
+def test_desconto_em_porcentagem_com_total_errado_vai_para_revisao():
+    boleta = _build(_boleta(
+        itens=[{"codigo": "2707569661", "valor": "124.80", "manuscrito": False}],
+        num_pecas=1, sub_total="124.80", desconto="10%", total="100.00",
+    ))
+    assert any("difere do TOTAL" in c for c in boleta.checks)
+
+
+def test_desconto_em_dinheiro_nao_ganha_tolerancia():
+    boleta = _build(_boleta(
+        itens=[{"codigo": "2707569661", "valor": "124.80", "manuscrito": False}],
+        num_pecas=1, sub_total="124.80", desconto="12.48", total="112.33",
+    ))
+    assert any("difere do TOTAL" in c for c in boleta.checks)
 
 
 # --- resposta do n8n --------------------------------------------------------

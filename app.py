@@ -413,9 +413,9 @@ else:
             st.session_state.pop("boletas_leitura", None)
             st.rerun()
 
-    guardados_arquivos, guardadas_boletas = default_cache().size()
-    if guardadas_boletas:
-        with st.expander(f"Leituras guardadas neste computador ({guardadas_boletas})"):
+    guardados = default_cache().size()
+    if guardados:
+        with st.expander(f"Leituras guardadas neste computador ({guardados} arquivo(s))"):
             st.caption(
                 "Cada boleta lida fica salva em `.cache/leituras/`, para que uma "
                 "leitura interrompida continue de onde parou e o mesmo arquivo não "

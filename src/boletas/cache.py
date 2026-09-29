@@ -26,11 +26,32 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 
 from src.boletas.render import RENDER_VERSION
 
 
 DEFAULT_DIR = Path(__file__).resolve().parents[2] / ".cache" / "leituras"
+
+_REPLACE_ATTEMPTS = 20
+_REPLACE_WAIT = 0.05
+
+
+def _replace_with_retry(source: str, target: Path) -> None:
+    """`os.replace` que aguenta o destino estar aberto por outro processo.
+
+    No Windows a troca falha com "acesso negado" enquanto alguém lê o destino —
+    antivírus examinando o arquivo recém-gravado, o indexador de busca, outra
+    sessão do app. É passageiro; aconteceu na leitura real de um mês inteiro.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_WAIT * (attempt + 1))
 
 
 class LeituraCache:
@@ -71,7 +92,7 @@ class LeituraCache:
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as output:
                 json.dump(entry, output, ensure_ascii=False)
-            os.replace(temporary, self._path(file_hash))
+            _replace_with_retry(temporary, self._path(file_hash))
         except BaseException:
             try:
                 os.unlink(temporary)
@@ -95,23 +116,32 @@ class LeituraCache:
             entry["boletas"][self._slot(page, position)] = payload
             self._save(file_hash, entry)
 
-    def mark_complete(self, file_hash: str) -> None:
-        """Registra que todas as boletas do arquivo foram lidas.
+    def mark_complete(self, file_hash: str, count: int) -> None:
+        """Registra que as `count` boletas do arquivo foram lidas.
 
-        Só vale quando não sobrou nenhuma falha: um arquivo marcado completo
-        é devolvido direto do cache, sem recortar, e uma boleta que faltou
-        nunca mais seria tentada.
+        Um arquivo marcado completo é devolvido direto do cache, sem recortar —
+        uma boleta que faltasse nunca mais seria tentada. Por isso a quantidade
+        esperada vai junto e é conferida na volta.
         """
         with self._lock:
             entry = self._load(file_hash)
             entry["complete"] = True
+            entry["count"] = count
             self._save(file_hash, entry)
 
     def complete_entries(self, file_hash: str) -> list[tuple[int, int, dict]] | None:
-        """Todas as leituras de um arquivo já lido por inteiro, ou `None`."""
+        """Todas as leituras de um arquivo já lido por inteiro, ou `None`.
+
+        Só confia na marca de completo se o número de leituras guardadas bate
+        com o de boletas que o arquivo tinha. Marca sem contagem — gravada antes
+        desta conferência existir — ou com buraco faz o arquivo ser recortado de
+        novo; o que já está guardado é aproveitado e só o que falta é lido.
+        """
         with self._lock:
             entry = self._load(file_hash)
             if not entry.get("complete"):
+                return None
+            if entry.get("count") != len(entry["boletas"]):
                 return None
             result = []
             for slot, payload in entry["boletas"].items():
@@ -127,21 +157,16 @@ class LeituraCache:
             except OSError:
                 pass
 
-    def size(self) -> tuple[int, int]:
-        """(arquivos, boletas) guardados."""
-        arquivos = boletas = 0
+    def size(self) -> int:
+        """Quantos arquivos têm leitura guardada.
+
+        Só lista o diretório. A tela chama isto a cada reexecução, e abrir cada
+        JSON seria lento com meses acumulados — e, no Windows, segurar o arquivo
+        aberto é justamente o que faz a gravação concorrente falhar.
+        """
         if not self.directory.exists():
-            return 0, 0
-        for path in self.directory.glob("*.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if data.get("render_version") != self.render_version:
-                continue
-            arquivos += 1
-            boletas += len(data.get("boletas", {}))
-        return arquivos, boletas
+            return 0
+        return sum(1 for _ in self.directory.glob("*.json"))
 
     def clear(self) -> None:
         with self._lock:

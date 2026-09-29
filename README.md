@@ -139,6 +139,45 @@ espera crescente, em vez de virar boleta perdida. Configuração em `.env`
 (`N8N_BOLETAS_CONCURRENCY`) e ajustes do lado do n8n em
 [`n8n/README.md`](n8n/README.md).
 
+### O que um mês inteiro revelou
+
+As boletas de referência (duas vendedoras, 7 boletas) não mostravam o jeito
+como as outras preenchem. Com as 783 do mês:
+
+- **Data com mês por extenso** — `05/SET`, `19 SET. 2026`, `9 SET`. O parser só
+  entendia `05/09` e **descartava a boleta inteira**: 208 sumiam do relatório.
+  Hoje entende os dois, e data que não dá para interpretar deixa a boleta sem
+  data em vez de derrubá-la.
+- **Data pelo nome do arquivo.** A loja salva `Boletas Leide 05.09.pdf`; o nome
+  bateu com a data escrita em 648 boletas e divergiu em 33, quase todas o
+  modelo comendo um dígito (`1 SET` num arquivo de 21/09). Vale a data do
+  arquivo, a boleta que diverge vai para revisão mostrando as duas, e o que for
+  digitado na tela vale mais que ambas. Cobre também as 99 boletas sem data
+  escrita.
+- **Desconto em porcentagem** — `10%`, `15%`. Era lido como R$ 10,00, sem
+  aviso. Hoje incide sobre o SUB TOTAL (ou a soma das peças), com um centavo de
+  tolerância para o arredondamento do caixa.
+- **Código com um dígito a menos.** 58 códigos lidos com 9 dígitos, nenhum no
+  CRM, onde todos têm 10. O cruzamento passou a reconhecer dígito faltando, além
+  de trocado, como erro de leitura.
+- **Veredito por dia.** Qualquer boleta em revisão travava o dia em REVISAR, e
+  os 22 dias saíam assim. Hoje só trava o que pode esconder peça (Nº PEÇAS que
+  não bate, peça sem valor); total manuscrito que não fecha não mexe no
+  casamento das etiquetas impressas.
+
+Resultado no mesmo lote, sem nenhuma leitura nova: 783 de 783 boletas no
+relatório (eram 570), 1.159 peças casadas com o CRM (eram 690), 415 "só no CRM"
+(eram 993).
+
+**O que ainda é ruído.** Das peças "só na boleta", 219 têm uma de mesmo valor no
+mesmo dia entre as "só no CRM", 89 delas a dois dígitos de distância: é o modelo
+errando o número impresso da etiqueta. A tolerância não foi estendida a dois
+dígitos porque variantes do mesmo produto podem ter códigos próximos e o mesmo
+preço, e casar errado esconderia divergência real. O caminho medido é ler as
+barras: um decodificador de código de barras (formato ITF) acertou 15 de 15
+etiquetas de referência e todas as 711 que conseguiu ler no mês existem no CRM,
+mas só acha 45% das etiquetas a 200 DPI.
+
 ## Regra de cálculo
 
 Todos os valores são convertidos para centavos antes dos cálculos.

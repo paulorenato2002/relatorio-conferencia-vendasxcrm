@@ -130,12 +130,20 @@ def test_corrigir_a_data_devolve_a_boleta_ao_dia_certo():
     assert all(b.checks == () for b in corrigido)
 
 
-def test_corrigir_a_data_para_outro_dia_solitario_mantem_a_suspeita():
+def test_data_digitada_na_tela_vale_mesmo_destoando_das_vizinhas():
+    # O operador tem o papel na mão: o que ele digita não é comparado com as
+    # outras boletas do arquivo nem com o nome dele.
     raw = [crua(1, data="27/09"), crua(2), crua(3), crua(4), crua(5)]
     corrigido = build_boletas(editar(raw, Data="15/09"), *PERIODO).boletas
-    suspeitas = [b for b in corrigido if b.date_suspect]
-    assert len(suspeitas) == 1
-    assert suspeitas[0].date == date(2026, 9, 15)
+    assert corrigido[0].date == date(2026, 9, 15)
+    assert corrigido[0].date_source == "confirmada"
+    assert not any(b.date_suspect for b in corrigido)
+
+
+def test_manter_a_data_lida_nao_conta_como_confirmacao():
+    raw = [crua(1, data="27/09"), crua(2), crua(3), crua(4), crua(5)]
+    intacto = build_boletas(editar(raw, Cliente="Maria"), *PERIODO).boletas
+    assert intacto[0].date_suspect is True
 
 
 def test_corrigir_numero_de_pecas_refaz_a_contagem():

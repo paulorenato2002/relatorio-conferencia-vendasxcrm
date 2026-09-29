@@ -25,11 +25,6 @@ from datetime import date
 from src.models import Boleta, BoletaData, CrmData, CrmItem
 
 
-# Quantos dígitos podem diferir para o código ainda ser considerado a mesma peça
-# mal lida. Um é o suficiente: os erros observados foram sempre de um dígito, e
-# dois já abre espaço para casar peças de verdade diferentes.
-_MAX_DIGIT_DISTANCE = 1
-
 STATUS_OK = "OK"
 STATUS_DIVERGENT = "DIVERGÊNCIA"
 STATUS_REVIEW = "REVISAR"
@@ -112,11 +107,21 @@ class CrosscheckReport:
         return [item for item in self.discrepancies if item.kind == kind]
 
 
-def _digit_distance(left: str, right: str) -> int | None:
-    """Dígitos diferentes entre dois códigos do mesmo tamanho, ou `None`."""
-    if len(left) != len(right):
-        return None
-    return sum(1 for a, b in zip(left, right) if a != b)
+def _one_digit_apart(left: str, right: str) -> bool:
+    """Os dois códigos diferem por um dígito trocado, sobrando ou faltando.
+
+    Trocado foi o primeiro erro medido (`3698637912` por `...992`). Faltando
+    apareceu no lote de setembro/2026: 58 códigos lidos com 9 dígitos, nenhum
+    existente no CRM, onde todos têm 10 — o modelo come um dígito da etiqueta.
+    """
+    if left == right:
+        return False
+    if len(left) == len(right):
+        return sum(1 for a, b in zip(left, right) if a != b) == 1
+    if abs(len(left) - len(right)) != 1:
+        return False
+    shorter, longer = sorted((left, right), key=len)
+    return any(longer[:i] + longer[i + 1:] == shorter for i in range(len(longer)))
 
 
 def _boleta_units(boleta: Boleta) -> list[tuple[str, int, bool]]:
@@ -171,7 +176,7 @@ def _match_day(
                     if crm_left[other] > 0
                     and other[1] == value
                     and other[2] == is_return
-                    and (_digit_distance(codigo, other[0]) or 99) <= _MAX_DIGIT_DISTANCE
+                    and _one_digit_apart(codigo, other[0])
                 ),
                 None,
             )
@@ -238,18 +243,26 @@ def _match_day(
 
 
 def _status(
-    boleta_count: int, only_boleta: int, only_crm: int, suspects: int, reviews: int
+    boleta_count: int, only_boleta: int, only_crm: int, suspects: int, uncertain: int
 ) -> str:
     if boleta_count == 0:
         return STATUS_NO_BOLETA
-    # Boleta em revisão ou código suspeito tornam o veredito não confiável: a
-    # divergência pode ser da leitura, não da loja. Dizer "DIVERGÊNCIA" aqui
-    # mandaria alguém investigar um erro que é nosso.
-    if reviews or suspects:
+    # Leitura suspeita não conta: é código a um dígito do CRM, mesmo dia e mesmo
+    # valor, que o cruzamento já tratou como a mesma peça. Ela fica listada para
+    # conferência, mas não explica nenhuma divergência que sobrou.
+    if not (only_boleta or only_crm):
+        return STATUS_OK
+    # Boleta com dúvida nas próprias peças (Nº PEÇAS que não bate, peça sem
+    # valor) ou fora do cruzamento pode estar escondendo peça: a divergência é
+    # inconclusiva, pode ser da leitura e não da loja.
+    #
+    # Qualquer outro motivo de revisão — total manuscrito que não fecha, nome
+    # ilegível — não entra: o cruzamento compara as etiquetas impressas. Na
+    # primeira versão entrava, junto com as leituras suspeitas, e no lote de
+    # setembro/2026 os 22 dias saíram REVISAR, sem um OK ou DIVERGÊNCIA sequer.
+    if uncertain:
         return STATUS_REVIEW
-    if only_boleta or only_crm:
-        return STATUS_DIVERGENT
-    return STATUS_OK
+    return STATUS_DIVERGENT
 
 
 def crosscheck(
@@ -294,6 +307,9 @@ def crosscheck(
         only_crm = sum(d.kind == KIND_MISSING_IN_BOLETA for d in day_discrepancies)
         suspects = sum(d.kind == KIND_SUSPECT_READ for d in day_discrepancies)
         reviews = sum(boleta.needs_review for boleta in day_boletas)
+        # Boleta fora do cruzamento também deixa o dia inconclusivo: as peças
+        # dela aparecem como "no CRM, fora da boleta" sem serem.
+        uncertain = excluded + sum(boleta.items_uncertain for boleta in matchable)
 
         rows.append(
             CrosscheckRow(
@@ -318,7 +334,7 @@ def crosscheck(
                 suspect_reads=suspects,
                 review_boletas=reviews,
                 status=_status(
-                    len(day_boletas), only_boleta, only_crm, suspects, reviews
+                    len(day_boletas), only_boleta, only_crm, suspects, uncertain
                 ),
             )
         )

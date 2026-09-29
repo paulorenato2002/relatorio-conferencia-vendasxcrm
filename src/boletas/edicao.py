@@ -92,6 +92,10 @@ def raw_from_frames(raw: Sequence[RawBoleta], headers: pd.DataFrame) -> list[Raw
                     )
                 else:
                     payload[campo] = _text(valor)
+            # Data digitada na tela é do operador, que tem o papel na mão: vale
+            # mais que a data do nome do arquivo.
+            if payload["data"] is not None and payload["data"] != _text(item.payload.get("data")):
+                payload["data_confirmada"] = True
         corrigidas.append(
             RawBoleta(
                 source_file=item.source_file,
