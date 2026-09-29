@@ -34,6 +34,7 @@ _ALIASES = {
     # de caixa continua funcionando: o cruzamento é que fica indisponível.
     "code": {"codigo", "codigo_produto", "cod_produto", "ean"},
     "gross": {"valor_bruto", "valor_bruto_item"},
+    "net": {"valor", "valor_liquido", "valor_liquido_item"},
     "sale_number": {"nrovenda", "nro_venda", "numero_venda", "num_venda"},
     "quantity": {"quantidade", "qtd", "qtde"},
     "product": {"produto", "descricao", "descricao_produto"},
@@ -96,7 +97,13 @@ def _build_item(row, mapping: dict[str, int], day, seller: str) -> CrmItem | Non
         quantity = int(float(_cell(row, mapping, "quantity") or 1))
     except (TypeError, ValueError):
         quantity = 1
+    try:
+        raw_net = _cell(row, mapping, "net")
+        net_cents = None if raw_net in (None, "") else parse_money_cents(raw_net)
+    except ValueError:
+        net_cents = None
     return CrmItem(
+        net_cents=net_cents,
         date=day,
         seller=seller,
         sale_number=str(_cell(row, mapping, "sale_number") or "").strip(),

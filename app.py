@@ -22,12 +22,7 @@ from src.boletas.edicao import (
     raw_from_frames,
     signature,
 )
-from src.crosscheck import (
-    KIND_MISSING_IN_BOLETA,
-    KIND_MISSING_IN_CRM,
-    KIND_SUSPECT_READ,
-    crosscheck,
-)
+from src.crosscheck import NOTE_KINDS, crosscheck
 from src.diagnostics import suggest_observations
 from src.formatters import format_brl_cents, format_brl_currency, format_date_br
 from src.parsers import (
@@ -165,24 +160,27 @@ def _boletas_dataframe(data) -> pd.DataFrame:
 
 
 def _crosscheck_dataframe(report) -> pd.DataFrame:
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "Data": format_date_br(row.date),
                 "Boletas": row.boleta_count,
                 "Fora do cruzamento": row.excluded_boletas,
-                "Peças casadas": row.matched_items,
-                "Só na boleta": row.only_boleta,
-                "Só no CRM": row.only_crm,
-                "Leitura suspeita": row.suspect_reads,
-                "Bruto boletas": format_brl_cents(row.boleta_gross_cents),
-                "Bruto CRM": format_brl_cents(row.crm_gross_cents),
-                "Diferença": format_brl_cents(row.gross_difference_cents),
+                "Vendas CRM": row.sale_count,
+                "Casadas": row.matched_sales,
+                "Venda sem boleta": row.sales_without_boleta,
+                "Boleta sem venda": row.boletas_without_sale,
+                "Peças que não fecham": row.piece_divergences,
+                "Valor CRM": format_brl_cents(row.crm_value_cents),
+                "Diferença": format_brl_cents(row.difference_cents),
                 "Status": row.status,
             }
             for row in report.rows
         ]
     )
+    if not report.totals.get("excluded_boletas"):
+        frame = frame.drop(columns=["Fora do cruzamento"])
+    return frame
 
 
 def _discrepancy_dataframe(items) -> pd.DataFrame:
@@ -190,13 +188,13 @@ def _discrepancy_dataframe(items) -> pd.DataFrame:
         [
             {
                 "Data": format_date_br(item.date),
-                "Código": item.codigo,
-                "Valor": format_brl_cents(item.value_cents),
-                "Tipo": "Devolução" if item.is_return else "Venda",
-                "Vendedora": item.seller or "—",
-                "Boleta": item.boleta_numero or (item.boleta_id or "—"),
+                "Tipo": item.label,
                 "Venda CRM": item.sale_number or "—",
-                "Produto": item.product or "—",
+                "Boleta": item.boleta_numero or (item.boleta_id or "—"),
+                "Vendedora": item.seller or "—",
+                "Código": item.codigo or "—",
+                "Diferença": format_brl_cents(item.impact_cents) if item.impact_cents else "—",
+                "Detalhe": item.detail,
             }
             for item in items
         ]
@@ -644,87 +642,76 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
     if cross is not None and cross.rows:
         st.divider()
         st.subheader("Cruzamento boletas × CRM")
-        cruzadas = cross.totals["boletas"]
-        fora = cross.totals.get("excluded_boletas", 0)
-        resumo = f"{cruzadas} boleta(s) cruzadas"
-        if fora:
-            resumo += f", {fora} fora do cruzamento (data sob suspeita)"
+        t = cross.totals
+        resumo = f"{t['boletas']} boleta(s) e {t['sales']} venda(s) do CRM"
+        if t.get("excluded_boletas"):
+            resumo += f"; {t['excluded_boletas']} boleta(s) fora do cruzamento (data sob suspeita)"
         st.caption(
-            f"{resumo}. Compara peça a peça pelo código de barras da etiqueta, "
-            "que é o mesmo código do CRM sem os zeros à esquerda."
+            f"{resumo}. Cada boleta é casada com a sua venda pelo número de controle, "
+            "pelas peças e pelo total; dentro da venda, as peças são conferidas uma a "
+            "uma. Diferença = boletas − CRM: negativa quando o CRM tem venda que não "
+            "aparece nas boletas."
         )
-        cross_cols = st.columns(4)
-        cross_cols[0].metric("Peças casadas", cross.totals["matched_items"])
-        cross_cols[1].metric("Na boleta, fora do CRM", cross.totals["only_boleta"])
-        cross_cols[2].metric("No CRM, fora da boleta", cross.totals["only_crm"])
-        cross_cols[3].metric("Leitura suspeita", cross.totals["suspect_reads"])
+        cross_cols = st.columns(5)
+        cross_cols[0].metric("Vendas casadas", f"{t['matched_sales']} de {t['sales']}")
+        cross_cols[1].metric("Vendas sem boleta", t["sales_without_boleta"])
+        cross_cols[2].metric("Boletas sem venda", t["boletas_without_sale"])
+        cross_cols[3].metric("Peças que não fecham", t["piece_divergences"])
+        cross_cols[4].metric("Diferença", format_brl_currency(t["difference_cents"]))
 
         if cross.days_divergent:
             st.error(
-                f"{cross.days_divergent} dia(s) com peça sem correspondência entre "
-                "boleta e CRM."
+                f"{cross.days_divergent} dia(s) com divergência entre boletas e CRM — "
+                "detalhe abaixo, com o valor de cada uma."
             )
-        elif cross.days_review:
+        if cross.days_review:
             st.warning(
-                f"{cross.days_review} dia(s) dependem de revisão manual antes de "
-                "concluir: há boleta com leitura duvidosa."
+                f"{cross.days_review} dia(s) com divergência que pode ser da leitura: a "
+                "boleta envolvida tem peça ilegível ou ficou fora do cruzamento. "
+                "Confira a boleta antes de concluir."
             )
-        elif cross.days_ok:
-            st.success("Todas as peças das boletas enviadas batem com o CRM.")
+        if cross.days_ok and not (cross.days_divergent or cross.days_review):
+            st.success("Todas as boletas enviadas fecham com as vendas do CRM.")
         if cross.days_without_boleta:
             st.info(
                 f"{cross.days_without_boleta} dia(s) do período sem boleta enviada — "
                 "esses dias não foram cruzados."
             )
-        if cross.totals.get("excluded_boletas"):
+        if t.get("excluded_boletas"):
             st.warning(
-                f"{cross.totals['excluded_boletas']} boleta(s) ficaram fora do "
-                "cruzamento por terem data sob suspeita. Enquanto a data não for "
-                "corrigida, as peças dessas boletas aparecem abaixo como “no CRM, "
-                "fora da boleta” — não são vendas sem registro."
+                f"{t['excluded_boletas']} boleta(s) ficaram fora do cruzamento por "
+                "terem data sob suspeita. Enquanto a data não for corrigida, a venda "
+                "delas aparece abaixo como venda sem boleta."
             )
 
-        st.dataframe(
-            _crosscheck_dataframe(cross), hide_index=True, width="stretch"
-        )
+        st.dataframe(_crosscheck_dataframe(cross), hide_index=True, width="stretch")
 
-        sem_crm = cross.by_kind(KIND_MISSING_IN_CRM)
-        if sem_crm:
-            st.markdown("**Peças na boleta e fora do CRM**")
+        divergencias = [item for item in cross.discrepancies if item.is_divergence]
+        if divergencias:
+            st.markdown("**Divergências**")
             st.caption(
-                "Venda registrada no papel sem linha correspondente no sistema. "
-                "Confirme a peça na boleta física antes de tratar como não registrada."
+                "Confira na boleta física. Venda sem boleta: boleta não enviada, "
+                "ilegível ou venda sem papel. Boleta sem venda: venda que não entrou "
+                "no sistema. Peça que não fecha: dentro da venda casada, com o TOTAL "
+                "da boleta diferente do CRM."
             )
             st.dataframe(
-                _discrepancy_dataframe(sem_crm), hide_index=True, width="stretch"
+                _discrepancy_dataframe(divergencias), hide_index=True, width="stretch"
             )
 
-        sem_boleta = cross.by_kind(KIND_MISSING_IN_BOLETA)
-        if sem_boleta:
-            st.markdown("**Peças no CRM e fora das boletas**")
-            st.caption("Venda no sistema sem boleta correspondente entre as enviadas.")
-            st.dataframe(
-                _discrepancy_dataframe(sem_boleta),
-                hide_index=True,
-                width="stretch",
-            )
-
-        suspeitas = cross.by_kind(KIND_SUSPECT_READ)
-        if suspeitas:
-            st.markdown("**Prováveis erros de leitura**")
-            st.caption(
-                "O código da boleta não existe no CRM, mas existe um a um dígito de "
-                "distância, no mesmo dia e com o mesmo valor. É mais provável que o "
-                "modelo tenha lido um dígito errado do que ser venda fora do sistema."
-            )
-            for item in suspeitas:
-                st.markdown(
-                    "- "
-                    + _md(
-                        f"{format_date_br(item.date)} · "
-                        f"{format_brl_currency(item.value_cents)} · {item.note}"
-                        + (f" · {item.product}" if item.product else "")
-                    )
+        notas = [item for item in cross.discrepancies if item.kind in NOTE_KINDS]
+        if notas:
+            with st.expander(
+                f"Observações de leitura ({len(notas)}) — não contam como divergência"
+            ):
+                st.caption(
+                    "Diferenças explicadas pela leitura: código de barras lido com "
+                    "dígito trocado, preço lido errado ou troca não transcrita numa "
+                    "boleta cujo TOTAL fecha com a venda, e boleta que veio no lote de "
+                    "outro dia."
+                )
+                st.dataframe(
+                    _discrepancy_dataframe(notas), hide_index=True, width="stretch"
                 )
     elif cross is not None:
         st.info(

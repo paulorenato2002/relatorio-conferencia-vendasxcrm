@@ -35,6 +35,24 @@ def test_pdf_generation_is_portrait_and_contains_report():
     assert "-0,00" not in text
 
 
+def test_pdf_traz_o_cruzamento_com_a_diferenca_em_reais():
+    from tests.test_crosscheck import DIA, boleta, crm_item, cruzar
+
+    cruzamento = cruzar(
+        [crm_item("2149308001", 11990), crm_item("4350069911", 11990, venda="17061")],
+        [boleta([("2149338801", "119.90")], controle="056", total="119.90")],
+    )
+    report = reconcile(
+        "Rezende", DIA, DIA, _crm({DIA: 23_980}), _rede({DIA: 23_980}), _cash({DIA: (0, 0)}),
+    )
+    pdf_bytes = generate_pdf_report(report, {}, crosscheck=cruzamento)
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(pdf_bytes)).pages)
+    assert "Cruzamento boletas × CRM" in text
+    assert "Venda no CRM sem boleta" in text and "17061" in text
+    assert "-119,90" in text
+    assert "Observações de leitura" in text and "lido diferente do CRM" in text
+
+
 def test_pdf_marks_missing_cash_day_as_pending_without_zero():
     first = date(2026, 7, 2)
     second = date(2026, 7, 3)

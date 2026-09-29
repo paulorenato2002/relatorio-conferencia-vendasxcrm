@@ -492,6 +492,38 @@ def test_recorte_cabe_na_resolucao_que_o_modelo_aceita_sem_reduzir():
     assert all(min(img.width, img.height) <= 768 for img in imagens)
 
 
+def _pagina_sintetica(*, fundo: int, linha: int):
+    """Duas boletas lado a lado: tabela de linhas finas e um pouco de manuscrito."""
+    import numpy as np
+    from PIL import Image
+
+    pagina = np.full((1000, 1200), fundo, dtype=np.uint8)
+    for esquerda in (100, 700):
+        for y in range(150, 850, 25):
+            pagina[y : y + 2, esquerda : esquerda + 400] = linha
+        pagina[160:170, esquerda + 20 : esquerda + 80] = 60
+    return Image.fromarray(pagina).convert("RGB")
+
+
+def test_boleta_de_linhas_claras_nao_e_tomada_por_vao():
+    # Daniely 01.09, página 4: a tabela da boleta 28861 é clara demais para
+    # contar como tinta, e a boleta inteira sumia do recorte.
+    from src.boletas.render import find_boleta_columns
+
+    colunas = find_boleta_columns(_pagina_sintetica(fundo=255, linha=200))
+    assert len(colunas) == 2
+    assert colunas[0][0] <= 100 and colunas[0][1] >= 500
+    assert colunas[1][0] <= 700 and colunas[1][1] >= 1100
+
+
+def test_fundo_cinza_uniforme_continua_sendo_vao():
+    # Scan escuro (Daniely 19.09, página 6): fundo cinza sem linha nenhuma não
+    # pode virar tabela e colar as boletas numa só.
+    from src.boletas.render import find_boleta_columns
+
+    assert len(find_boleta_columns(_pagina_sintetica(fundo=185, linha=140))) == 2
+
+
 def test_arquivo_vazio_falha_com_mensagem_clara():
     class _Vazio(bytes):
         name = "vazio.pdf"

@@ -260,11 +260,31 @@ _CROSSCHECK_COLORS = {
 }
 
 
+def _grid(data, widths, *, total_row: bool = False) -> Table:
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ]
+    if total_row:
+        commands += [
+            ("BACKGROUND", (0, -1), (-1, -1), LIGHT),
+            ("LINEABOVE", (0, -1), (-1, -1), 0.9, NAVY),
+        ]
+    table.setStyle(TableStyle(commands))
+    return table
+
+
 def _crosscheck_daily_table(crosscheck, styles) -> Table:
     headers = [
-        "Data", "Bol.", "Fora do<br/>cruzam.", "Peças<br/>casadas",
-        "Só na<br/>boleta", "Só no<br/>CRM", "Leitura<br/>suspeita",
-        "Bruto<br/>boletas", "Bruto CRM", "Status",
+        "Data", "Bol.", "Vendas<br/>CRM", "Casadas", "Venda sem<br/>boleta",
+        "Boleta sem<br/>venda", "Peças que<br/>não fecham", "Valor CRM", "Diferença", "Status",
     ]
     data = [[Paragraph(header, styles["table_header"]) for header in headers]]
     for row in crosscheck.rows:
@@ -272,102 +292,123 @@ def _crosscheck_daily_table(crosscheck, styles) -> Table:
             [
                 Paragraph(format_date_br(row.date), styles["center"]),
                 Paragraph(str(row.boleta_count), styles["center"]),
-                Paragraph(str(row.excluded_boletas), styles["center"]),
-                Paragraph(str(row.matched_items), styles["center"]),
-                Paragraph(str(row.only_boleta), styles["center"]),
-                Paragraph(str(row.only_crm), styles["center"]),
-                Paragraph(str(row.suspect_reads), styles["center"]),
-                Paragraph(format_brl_cents(row.boleta_gross_cents), styles["right"]),
-                Paragraph(format_brl_cents(row.crm_gross_cents), styles["right"]),
+                Paragraph(str(row.sale_count), styles["center"]),
+                Paragraph(str(row.matched_sales), styles["center"]),
+                Paragraph(str(row.sales_without_boleta or "-"), styles["center"]),
+                Paragraph(str(row.boletas_without_sale or "-"), styles["center"]),
+                Paragraph(str(row.piece_divergences or "-"), styles["center"]),
+                Paragraph(format_brl_cents(row.crm_value_cents), styles["right"]),
+                Paragraph(format_brl_cents(row.difference_cents), styles["right"]),
                 Paragraph(row.status, styles["center"]),
             ]
         )
-    widths = [19 * mm, 13 * mm, 16 * mm, 16 * mm, 15 * mm, 15 * mm, 17 * mm, 21 * mm, 21 * mm, 25 * mm]
-    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
-    commands = [
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("BOX", (0, 0), (-1, -1), 0.6, LINE),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]
+    t = crosscheck.totals
+    geral = (
+        "DIVERGÊNCIA" if crosscheck.days_divergent
+        else "REVISAR" if crosscheck.days_review
+        else "OK"
+    )
+    data.append(
+        [
+            Paragraph("<b>TOTAL</b>", styles["center"]),
+            Paragraph(f"<b>{t['boletas']}</b>", styles["center"]),
+            Paragraph(f"<b>{t['sales']}</b>", styles["center"]),
+            Paragraph(f"<b>{t['matched_sales']}</b>", styles["center"]),
+            Paragraph(f"<b>{t['sales_without_boleta']}</b>", styles["center"]),
+            Paragraph(f"<b>{t['boletas_without_sale']}</b>", styles["center"]),
+            Paragraph(f"<b>{t['piece_divergences']}</b>", styles["center"]),
+            Paragraph(f"<b>{format_brl_cents(t['crm_value_cents'])}</b>", styles["right"]),
+            Paragraph(f"<b>{format_brl_cents(t['difference_cents'])}</b>", styles["right"]),
+            Paragraph(f"<b>{geral}</b>", styles["center"]),
+        ]
+    )
+    widths = [17 * mm, 11 * mm, 14 * mm, 15 * mm, 17 * mm, 17 * mm, 18 * mm, 23 * mm, 21 * mm, 25 * mm]
+    table = _grid(data, widths, total_row=True)
+    commands = []
     for index, row in enumerate(crosscheck.rows, 1):
         color, background = _CROSSCHECK_COLORS.get(row.status, (SLATE, LIGHT))
-        commands.extend(
-            [
-                ("BACKGROUND", (-1, index), (-1, index), background),
-                ("TEXTCOLOR", (-1, index), (-1, index), color),
-            ]
-        )
+        commands += [
+            ("BACKGROUND", (-1, index), (-1, index), background),
+            ("TEXTCOLOR", (-1, index), (-1, index), color),
+        ]
+        if row.difference_cents:
+            commands.append(("TEXTCOLOR", (-2, index), (-2, index), color))
     table.setStyle(TableStyle(commands))
     return table
 
 
-def _discrepancy_table(items, styles) -> Table:
-    headers = ["Data", "Código", "Valor", "Tipo", "Vendedora", "Boleta", "Venda CRM", "Produto"]
+def _discrepancy_table(items, styles, *, with_difference: bool = True) -> Table:
+    headers = ["Data", "Tipo", "Venda<br/>CRM", "Boleta", "Vendedora", "Código"]
+    headers += ["Diferença"] if with_difference else []
+    headers += ["Detalhe"]
     data = [[Paragraph(header, styles["table_header"]) for header in headers]]
     for item in items:
-        data.append(
-            [
-                Paragraph(format_date_br(item.date), styles["center"]),
-                Paragraph(escape(item.codigo), styles["center"]),
-                Paragraph(format_brl_cents(item.value_cents), styles["right"]),
-                Paragraph("Devolução" if item.is_return else "Venda", styles["center"]),
-                Paragraph(escape(item.seller or "-"), styles["small"]),
-                Paragraph(escape(item.boleta_numero or "-"), styles["center"]),
-                Paragraph(escape(item.sale_number or "-"), styles["center"]),
-                Paragraph(escape((item.product or "-")[:38]), styles["small"]),
-            ]
-        )
-    widths = [20 * mm, 24 * mm, 20 * mm, 20 * mm, 22 * mm, 16 * mm, 19 * mm, 37 * mm]
-    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-                ("BOX", (0, 0), (-1, -1), 0.6, LINE),
-                ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]
-        )
-    )
-    return table
+        cells = [
+            Paragraph(item.date.strftime("%d/%m"), styles["center"]),
+            Paragraph(escape(item.label), styles["small"]),
+            Paragraph(escape(item.sale_number or "-"), styles["center"]),
+            Paragraph(escape(item.boleta_numero or "-"), styles["center"]),
+            Paragraph(escape((item.seller or "-")[:14]), styles["small"]),
+            Paragraph(escape(item.codigo or "-"), styles["center"]),
+        ]
+        if with_difference:
+            cells.append(Paragraph(format_brl_cents(item.impact_cents), styles["right"]))
+        cells.append(Paragraph(escape(item.detail), styles["small"]))
+        data.append(cells)
+    if with_difference:
+        widths = [12 * mm, 34 * mm, 13 * mm, 13 * mm, 18 * mm, 21 * mm, 18 * mm, 49 * mm]
+    else:
+        widths = [12 * mm, 34 * mm, 13 * mm, 13 * mm, 18 * mm, 21 * mm, 67 * mm]
+    return _grid(data, widths)
 
 
 def _crosscheck_section(crosscheck, styles):
-    """Seção do cruzamento peça a peça entre boletas e CRM."""
+    """Seção do cruzamento boleta a venda entre boletas e CRM."""
     from src.crosscheck import (
-        KIND_MISSING_IN_BOLETA,
-        KIND_MISSING_IN_CRM,
-        KIND_SUSPECT_READ,
+        KIND_CODE_MISREAD,
+        KIND_LABELS,
+        KIND_OTHER_DAY,
+        KIND_READING_ONLY,
+        KIND_TOTAL_MATCH,
     )
 
+    t = crosscheck.totals
+    diferenca = t["difference_cents"]
+    cor = GREEN if not diferenca else RED
     flowables = [
         Paragraph("Cruzamento boletas × CRM", styles["section"]),
         Paragraph(
-            "Comparação peça a peça pelo código de barras da etiqueta, que é o mesmo "
-            "código do CRM sem os zeros à esquerda. Dias sem boleta enviada não são "
-            "cruzados e aparecem como SEM BOLETA.",
+            "Cada boleta é casada com a sua venda do CRM pelo número de controle "
+            "(final do nº da venda), pelas peças e pelo total; dentro da venda, as "
+            "peças são conferidas uma a uma. Quando o TOTAL escrito na boleta fecha "
+            "com a venda, peça lida diferente é erro de leitura e fica nas "
+            "observações. Diferença = boletas − CRM: negativa quando o CRM tem venda "
+            "que não aparece nas boletas. Dias sem boleta enviada aparecem como SEM "
+            "BOLETA.",
             styles["small"],
         ),
         Spacer(1, 3 * mm),
         Table(
             [[
-                Paragraph(f"<b>Peças casadas:</b> {crosscheck.totals['matched_items']}", styles["body"]),
-                Paragraph(f"<b>Na boleta, fora do CRM:</b> {crosscheck.totals['only_boleta']}", styles["body"]),
-                Paragraph(f"<b>No CRM, fora da boleta:</b> {crosscheck.totals['only_crm']}", styles["body"]),
-                Paragraph(f"<b>Leitura suspeita:</b> {crosscheck.totals['suspect_reads']}", styles["body"]),
+                Paragraph(f"<b>Vendas casadas:</b> {t['matched_sales']} de {t['sales']}", styles["body"]),
+                Paragraph(f"<b>Vendas sem boleta:</b> {t['sales_without_boleta']}", styles["body"]),
+                Paragraph(f"<b>Boletas sem venda:</b> {t['boletas_without_sale']}", styles["body"]),
+                Paragraph(f"<b>Peças que não fecham:</b> {t['piece_divergences']}", styles["body"]),
+                Paragraph(
+                    f"<b>Diferença:</b> <font color='{cor.hexval()}'>"
+                    f"{escape(format_brl_currency(diferenca))}</font>",
+                    styles["body"],
+                ),
             ]],
-            colWidths=[38 * mm, 50 * mm, 50 * mm, 40 * mm],
+            colWidths=[35 * mm, 31 * mm, 31 * mm, 35 * mm, 46 * mm],
             style=TableStyle(
                 [
+                    ("BACKGROUND", (0, 0), (-1, -1), LIGHT),
                     ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                 ]
@@ -377,72 +418,60 @@ def _crosscheck_section(crosscheck, styles):
         _crosscheck_daily_table(crosscheck, styles),
     ]
 
-    if crosscheck.totals.get("excluded_boletas"):
-        flowables.extend(
-            [
+    if t.get("excluded_boletas"):
+        flowables += [
+            Spacer(1, 2 * mm),
+            Paragraph(
+                f"{t['excluded_boletas']} boleta(s) ficaram fora do cruzamento por terem "
+                "data sob suspeita. Enquanto a data não for corrigida, a venda delas "
+                "consta abaixo como venda sem boleta.",
+                styles["small"],
+            ),
+        ]
+
+    divergencias = [item for item in crosscheck.discrepancies if item.is_divergence]
+    if divergencias:
+        flowables += [
+            Spacer(1, 5 * mm),
+            Paragraph("Divergências boletas × CRM", styles["section"]),
+            Paragraph(
+                "Conferir na boleta física. Venda sem boleta: boleta não enviada, "
+                "ilegível ou venda sem papel. Boleta sem venda: venda que não entrou "
+                "no sistema. Peça que não fecha: dentro da venda casada, com o TOTAL "
+                "da boleta diferente do CRM.",
+                styles["small"],
+            ),
+            Spacer(1, 2 * mm),
+            _discrepancy_table(divergencias, styles),
+        ]
+
+    contagem = {
+        kind: len(crosscheck.by_kind(kind))
+        for kind in (KIND_CODE_MISREAD, KIND_READING_ONLY, KIND_TOTAL_MATCH, KIND_OTHER_DAY)
+    }
+    if any(contagem.values()):
+        partes = [f"{KIND_LABELS[kind][0].lower()}{KIND_LABELS[kind][1:]}: {n}"
+                  for kind, n in contagem.items() if n]
+        flowables += [
+            Spacer(1, 5 * mm),
+            Paragraph("Observações de leitura", styles["section"]),
+            Paragraph(
+                "Não contam como divergência nem entram na diferença. "
+                + escape("; ".join(partes)) + ".",
+                styles["small"],
+            ),
+        ]
+        detalhadas = [
+            item for item in crosscheck.discrepancies
+            if item.kind in (KIND_READING_ONLY, KIND_TOTAL_MATCH, KIND_OTHER_DAY)
+        ]
+        if detalhadas:
+            flowables += [
                 Spacer(1, 2 * mm),
-                Paragraph(
-                    f"{crosscheck.totals['excluded_boletas']} boleta(s) ficaram fora do "
-                    "cruzamento por terem data sob suspeita. Enquanto a data nao for "
-                    "corrigida, as pecas dessas boletas constam abaixo como \"no CRM, "
-                    "fora da boleta\" e nao devem ser lidas como venda sem registro.",
-                    styles["small"],
+                _discrepancy_table(
+                    sorted(detalhadas, key=lambda item: item.date), styles, with_difference=False
                 ),
             ]
-        )
-
-    blocos = [
-        (
-            KIND_MISSING_IN_CRM,
-            "Peças na boleta e fora do CRM",
-            "Venda registrada no papel sem linha correspondente no sistema. Confirmar "
-            "a peça na boleta física antes de tratar como venda não registrada.",
-        ),
-        (
-            KIND_MISSING_IN_BOLETA,
-            "Peças no CRM e fora das boletas",
-            "Venda no sistema sem peça correspondente entre as boletas enviadas.",
-        ),
-    ]
-    for kind, titulo, nota in blocos:
-        items = crosscheck.by_kind(kind)
-        if not items:
-            continue
-        flowables.extend(
-            [
-                Spacer(1, 5 * mm),
-                Paragraph(titulo, styles["section"]),
-                Paragraph(nota, styles["small"]),
-                Spacer(1, 2 * mm),
-                _discrepancy_table(items, styles),
-            ]
-        )
-
-    suspeitas = crosscheck.by_kind(KIND_SUSPECT_READ)
-    if suspeitas:
-        flowables.extend(
-            [
-                Spacer(1, 5 * mm),
-                Paragraph("Prováveis erros de leitura", styles["section"]),
-                Paragraph(
-                    "O código lido na boleta não existe no CRM, mas existe um a um "
-                    "dígito de distância, no mesmo dia e com o mesmo valor. É mais "
-                    "provável erro de transcrição do que venda fora do sistema; estas "
-                    "peças não foram contadas como divergência.",
-                    styles["small"],
-                ),
-                Spacer(1, 2 * mm),
-            ]
-        )
-        for item in suspeitas:
-            flowables.append(
-                Paragraph(
-                    f"{format_date_br(item.date)} &middot; "
-                    f"{format_brl_currency(item.value_cents)} &middot; {escape(item.note)}"
-                    + (f" &middot; {escape(item.product)}" if item.product else ""),
-                    styles["small"],
-                )
-            )
     return flowables
 
 

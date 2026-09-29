@@ -9,6 +9,16 @@ modo que a imagem chega ao modelo sem redução.
 O recorte usa projeção de coluna: boletas são separadas por faixas verticais
 sem tinta. Não há aprendizado de máquina envolvido.
 
+Tinta sozinha não basta. Boleta escaneada clara — linhas da tabela em cinza
+claro, pouco manuscrito — tem colunas inteiras abaixo do limiar de tinta, e o
+recorte a tomava por vão: em setembro/2026, 22 páginas saíram com boleta
+faltando, partida ao meio ou com três boletas numa imagem só (a boleta 28861 de
+01/09 nunca chegou ao modelo). O que distingue a boleta do vão é a tabela: a
+coluna que cruza linhas horizontais longas é boleta, por mais clara que seja.
+A linha é achada pelo contraste com o papel logo acima e logo abaixo, e não
+por um limiar de cinza fixo, porque scan escuro tem fundo cinza uniforme — um
+limiar que pegasse a linha clara pegaria o fundo também.
+
 Volume: um mês de uma loja são ~800 boletas em ~330 páginas. As páginas são
 geradas uma de cada vez (`iter_boletas`), para que o envio comece na primeira
 boleta e a memória fique limitada ao que está em trânsito — antes o lote
@@ -50,7 +60,7 @@ MIME_TYPE = "image/png"
 
 # Muda sempre que o recorte muda de um jeito que altere a imagem enviada. Entra
 # na chave do cache de leituras: recorte diferente, leitura refeita.
-RENDER_VERSION = "2026-09-png6-v1"
+RENDER_VERSION = "2026-09-png6-v2"
 
 # Limiar de cinza abaixo do qual o pixel conta como tinta.
 _INK_THRESHOLD = 165
@@ -67,6 +77,15 @@ _MIN_SEGMENT = 0.10
 _PADDING = 8
 # Ignora topo e rodapé ao medir tinta (marca d'água do scanner, bordas).
 _VERTICAL_TRIM = 0.06
+
+# Linha horizontal da tabela: pixel mais escuro que o papel `_RULE_OFFSET` px
+# acima e abaixo por pelo menos `_RULE_CONTRAST` tons de cinza, em trecho
+# contínuo de ao menos `_RULE_MIN_LENGTH` da largura da página. A coluna
+# cruzada por `_RULE_MIN_COVERAGE` linhas ou mais não é vão.
+_RULE_OFFSET = 4
+_RULE_CONTRAST = 18
+_RULE_MIN_LENGTH = 0.12
+_RULE_MIN_COVERAGE = 3
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -158,16 +177,40 @@ def _iter_pages(data: bytes, file_name: str, dpi: int) -> Iterator[Image.Image]:
         raise BoletaRenderError(f"{file_name}: não foi possível abrir a imagem.") from exc
 
 
+def _rule_coverage(band: np.ndarray) -> np.ndarray:
+    """Quantas linhas horizontais longas cruzam cada coluna da faixa."""
+    width = band.shape[1]
+    length = max(2, int(width * _RULE_MIN_LENGTH))
+    if length >= width or band.shape[0] <= 2 * _RULE_OFFSET:
+        return np.zeros(width, dtype=np.int32)
+    gray = band.astype(np.int16)
+    k = _RULE_OFFSET
+    dark = np.zeros(gray.shape, dtype=bool)
+    dark[k:-k] = (gray[k:-k] < gray[: -2 * k] - _RULE_CONTRAST) & (
+        gray[k:-k] < gray[2 * k :] - _RULE_CONTRAST
+    )
+    # Trecho escuro contínuo de `length` pixels começando em cada coluna.
+    runs = np.pad(np.cumsum(dark, axis=1, dtype=np.int32), ((0, 0), (1, 0)))
+    full = (runs[:, length:] - runs[:, :-length]) == length
+    # Coluna x coberta se algum trecho completo começa em [x - length + 1, x].
+    starts = np.pad(np.cumsum(full, axis=1, dtype=np.int32), ((0, 0), (1, 0)))
+    x = np.arange(width)
+    high = np.minimum(x, width - length) + 1
+    low = np.maximum(0, x - length + 1)
+    return ((starts[:, high] - starts[:, low]) > 0).sum(axis=0)
+
+
 def find_boleta_columns(image: Image.Image) -> list[tuple[int, int]]:
     """Devolve os intervalos horizontais (início, fim) de cada boleta da página."""
     grayscale = np.asarray(image.convert("L"), dtype=np.uint8)
     height, width = grayscale.shape
     band = grayscale[int(height * _VERTICAL_TRIM) : int(height * (1 - _VERTICAL_TRIM)), :]
     ink_ratio = (band < _INK_THRESHOLD).mean(axis=0)
+    empty = (ink_ratio < _EMPTY_MAX) & (_rule_coverage(band) < _RULE_MIN_COVERAGE)
 
     gutters: list[list[int]] = []
     start: int | None = None
-    for index, is_empty in enumerate(ink_ratio < _EMPTY_MAX):
+    for index, is_empty in enumerate(empty):
         if is_empty and start is None:
             start = index
         elif not is_empty and start is not None:

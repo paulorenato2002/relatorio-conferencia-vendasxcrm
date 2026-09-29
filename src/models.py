@@ -21,6 +21,10 @@ class CrmItem:
     gross_cents: int
     quantity: int
     product: str
+    # Coluna `valor`: o bruto menos o desconto da venda. É o que o cliente pagou
+    # e o que o TOTAL manuscrito da boleta registra. `None` quando a planilha não
+    # traz a coluna.
+    net_cents: int | None = None
 
     @property
     def is_return(self) -> bool:
