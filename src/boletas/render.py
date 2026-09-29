@@ -8,13 +8,21 @@ modo que a imagem chega ao modelo sem redução.
 
 O recorte usa projeção de coluna: boletas são separadas por faixas verticais
 sem tinta. Não há aprendizado de máquina envolvido.
+
+Volume: um mês de uma loja são ~800 boletas em ~330 páginas. As páginas são
+geradas uma de cada vez (`iter_boletas`), para que o envio comece na primeira
+boleta e a memória fique limitada ao que está em trânsito — antes o lote
+inteiro era recortado de antemão, retendo 350 MB e cinco minutos de silêncio
+antes da primeira requisição.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from io import BytesIO
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 from PIL import Image
@@ -28,6 +36,21 @@ DEFAULT_DPI = 200
 # de processá-la. Enviar mais que isso é banda gasta em pixels descartados, e a
 # redução do lado deles não é melhor que a nossa.
 MAX_SHORT_SIDE = 768
+
+# PNG, que é sem perda. JPEG foi medido e descartado: q90 deixa a imagem 3x
+# menor, mas errou a vendedora cursiva em 6 de 21 leituras contra 1 do PNG
+# (3 rodadas das 7 boletas de referência; 89,8% contra 93,2% nos campos
+# críticos). Como o recorte roda em paralelo com o envio e a rede é o
+# gargalo, o tamanho não compensava.
+#
+# Nível 6 em vez de `optimize=True`: mesmos pixels — é compressão sem perda —,
+# 3% maior e 3,7x mais rápido (65 ms contra 241 ms por boleta).
+PNG_COMPRESS_LEVEL = 6
+MIME_TYPE = "image/png"
+
+# Muda sempre que o recorte muda de um jeito que altere a imagem enviada. Entra
+# na chave do cache de leituras: recorte diferente, leitura refeita.
+RENDER_VERSION = "2026-09-png6-v1"
 
 # Limiar de cinza abaixo do qual o pixel conta como tinta.
 _INK_THRESHOLD = 165
@@ -57,22 +80,57 @@ class BoletaImage:
     """Uma boleta isolada, pronta para ser enviada ao n8n."""
 
     source_file: str
+    file_hash: str
     page: int
     position: int
-    png: bytes
+    data: bytes
     width: int
     height: int
+    mime: str = MIME_TYPE
 
     @property
     def image_id(self) -> str:
         return f"{self.source_file}#p{self.page}b{self.position}"
+
+    @property
+    def extension(self) -> str:
+        return "png" if self.mime == "image/png" else "jpg"
+
+
+def file_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _is_pdf(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 
-def _page_images(data: bytes, file_name: str, dpi: int) -> list[Image.Image]:
+def _check_supported(data: bytes, file_name: str) -> None:
+    if not data:
+        raise BoletaRenderError(f"{file_name}: arquivo vazio.")
+    if not _is_pdf(data) and Path(file_name).suffix.lower() not in _IMAGE_SUFFIXES:
+        raise BoletaRenderError(
+            f"{file_name}: formato não suportado. Envie PDF escaneado ou imagem "
+            "(PNG, JPG, WEBP, BMP, TIFF)."
+        )
+
+
+def count_pages(data: bytes, file_name: str = "boletas.pdf") -> int:
+    """Quantidade de páginas, sem renderizar nada. Serve para estimar progresso."""
+    _check_supported(data, file_name)
+    if not _is_pdf(data):
+        return 1
+    import pymupdf
+
+    try:
+        with pymupdf.open(stream=data, filetype="pdf") as document:
+            return document.page_count
+    except Exception as exc:
+        raise BoletaRenderError(f"{file_name}: não foi possível abrir o PDF.") from exc
+
+
+def _iter_pages(data: bytes, file_name: str, dpi: int) -> Iterator[Image.Image]:
+    """Uma página de cada vez: nunca o documento inteiro em memória."""
     if _is_pdf(data):
         try:
             import pymupdf
@@ -84,25 +142,20 @@ def _page_images(data: bytes, file_name: str, dpi: int) -> list[Image.Image]:
             document = pymupdf.open(stream=data, filetype="pdf")
         except Exception as exc:
             raise BoletaRenderError(f"{file_name}: não foi possível abrir o PDF.") from exc
-        pages = []
         with document:
+            if document.page_count == 0:
+                raise BoletaRenderError(f"{file_name}: o PDF não contém páginas.")
             for page in document:
-                pixmap = page.get_pixmap(dpi=dpi)
-                pages.append(Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGB"))
-        if not pages:
-            raise BoletaRenderError(f"{file_name}: o PDF não contém páginas.")
-        return pages
+                pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+                # `samples` direto no PIL: passar por PNG custava 346 ms por
+                # página contra 74 ms, com resultado idêntico pixel a pixel.
+                yield Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        return
 
-    if Path(file_name).suffix.lower() in _IMAGE_SUFFIXES:
-        try:
-            return [Image.open(BytesIO(data)).convert("RGB")]
-        except Exception as exc:
-            raise BoletaRenderError(f"{file_name}: não foi possível abrir a imagem.") from exc
-
-    raise BoletaRenderError(
-        f"{file_name}: formato não suportado. Envie PDF escaneado ou imagem "
-        "(PNG, JPG, WEBP, BMP, TIFF)."
-    )
+    try:
+        yield Image.open(BytesIO(data)).convert("RGB")
+    except Exception as exc:
+        raise BoletaRenderError(f"{file_name}: não foi possível abrir a imagem.") from exc
 
 
 def find_boleta_columns(image: Image.Image) -> list[tuple[int, int]]:
@@ -154,19 +207,21 @@ def _fit_short_side(image: Image.Image, limit: int) -> Image.Image:
     )
 
 
-def render_boletas(source: BinarySource, dpi: int = DEFAULT_DPI) -> list[BoletaImage]:
-    """Recorta cada boleta de um scan e devolve uma imagem PNG por boleta.
+def iter_boletas(
+    data: bytes,
+    file_name: str,
+    *,
+    dpi: int = DEFAULT_DPI,
+    digest: str | None = None,
+) -> Iterator[BoletaImage]:
+    """Gera as boletas de um arquivo, uma de cada vez, na ordem das páginas.
 
     Quando a página não se divide em colunas — boleta fotografada sozinha, por
     exemplo — a página inteira é devolvida como uma única boleta.
     """
-    file_name = source_name(source, "boletas.pdf")
-    data = source_bytes(source)
-    if not data:
-        raise BoletaRenderError(f"{file_name}: arquivo vazio.")
-
-    results: list[BoletaImage] = []
-    for page_number, page_image in enumerate(_page_images(data, file_name, dpi), start=1):
+    _check_supported(data, file_name)
+    digest = digest or file_hash(data)
+    for page_number, page_image in enumerate(_iter_pages(data, file_name, dpi), start=1):
         segments = find_boleta_columns(page_image) or [(0, page_image.width)]
         for position, (left, right) in enumerate(segments, start=1):
             crop = _fit_short_side(
@@ -181,18 +236,27 @@ def render_boletas(source: BinarySource, dpi: int = DEFAULT_DPI) -> list[BoletaI
                 MAX_SHORT_SIDE,
             )
             buffer = BytesIO()
-            crop.save(buffer, format="PNG", optimize=True)
-            results.append(
-                BoletaImage(
-                    source_file=file_name,
-                    page=page_number,
-                    position=position,
-                    png=buffer.getvalue(),
-                    width=crop.width,
-                    height=crop.height,
-                )
+            crop.save(buffer, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
+            yield BoletaImage(
+                source_file=file_name,
+                file_hash=digest,
+                page=page_number,
+                position=position,
+                data=buffer.getvalue(),
+                width=crop.width,
+                height=crop.height,
             )
 
+
+def render_boletas(source: BinarySource, dpi: int = DEFAULT_DPI) -> list[BoletaImage]:
+    """Recorta todas as boletas de um arquivo de uma vez.
+
+    Para lotes grandes prefira `iter_boletas`: esta função guarda todas as
+    imagens em memória antes de devolver.
+    """
+    file_name = source_name(source, "boletas.pdf")
+    data = source_bytes(source)
+    results = list(iter_boletas(data, file_name, dpi=dpi))
     if not results:
         raise BoletaRenderError(f"{file_name}: nenhuma boleta foi localizada no arquivo.")
     return results

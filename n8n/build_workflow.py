@@ -22,6 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "workflow.json"
 JS_OUT = HERE / "montar-requisicao.js"
+JS_RESPOSTA_OUT = HERE / "montar-resposta.js"
 
 SYSTEM = """Você transcreve boletas manuscritas de pedido de compra de uma loja de bijuterias (rede Morana). Você devolve apenas o que está escrito. Você nunca inventa, nunca completa e nunca corrige um valor.
 
@@ -133,6 +134,9 @@ if (binarios.length === 0) {
   );
 }
 const propriedade = binarios.includes('boleta') ? 'boleta' : binarios[0];
+// O tipo vem do próprio upload (o app manda PNG), para que outro formato
+// funcione sem mexer aqui.
+const mime = entrada.binary[propriedade]?.mimeType || 'image/png';
 
 // Dois caminhos para o base64. O helper é o correto quando o n8n guarda o
 // binário em disco (o Cloud faz isso acima de certo tamanho) e nem sempre está
@@ -176,7 +180,7 @@ return [{
             { type: 'text', text: USER },
             {
               type: 'image_url',
-              image_url: { url: `data:image/png;base64,${base64}`, detail: 'high' },
+              image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' },
             },
           ],
         },
@@ -190,7 +194,7 @@ return [{
     "schema": json.dumps(SCHEMA, ensure_ascii=False, indent=2),
 }
 
-RESPONSE_CODE = """// Desempacota a resposta do OpenAI no contrato acordado com o app Python.
+RESPONSE_CODE = r"""// Desempacota a resposta do OpenAI no contrato acordado com o app Python.
 // Falha vira { error }: o cliente registra um aviso naquela boleta e segue com
 // o resto do lote, em vez de derrubar a leitura inteira.
 const origem = $('Montar requisicao').first().json;
@@ -205,8 +209,15 @@ const resposta = $input.first().json;
 const conteudo = resposta?.choices?.[0]?.message?.content;
 
 if (!conteudo) {
-  const motivo = resposta?.error?.message || 'o modelo não devolveu conteúdo';
-  return [{ json: { ...identidade, error: `Falha na leitura: ${motivo}` } }];
+  const erro = resposta?.error || {};
+  const motivo = erro.message || erro.description || 'o modelo não devolveu conteúdo';
+  // Status HTTP da OpenAI, quando houver: é o que diz ao app se a falha é
+  // passageira (429, 5xx — vale tentar de novo) ou definitiva.
+  const status = Number(
+    erro.httpCode || erro.status || erro.cause?.status ||
+    (String(motivo).match(/\b(4\d\d|5\d\d)\b/) || [])[1]
+  ) || null;
+  return [{ json: { ...identidade, upstream_status: status, error: `Falha na leitura: ${motivo}` } }];
 }
 
 let boleta;
@@ -268,8 +279,8 @@ workflow = {
             "notes": "Structured Outputs garante a forma do JSON. A chave fica na credencial OpenAI.",
             "notesInFlow": True,
             "retryOnFail": True,
-            "maxTries": 3,
-            "waitBetweenTries": 2000,
+            "maxTries": 5,
+            "waitBetweenTries": 5000,
             "onError": "continueRegularOutput",
         },
         {
@@ -295,12 +306,22 @@ workflow = {
         "OpenAI Visao": {"main": [[{"node": "Montar resposta", "type": "main", "index": 0}]]},
         "Montar resposta": {"main": [[{"node": "Responder", "type": "main", "index": 0}]]},
     },
-    "settings": {"executionOrder": "v1"},
+    "settings": {
+        "executionOrder": "v1",
+        # Cada execução carrega a imagem e o payload em base64 (~1 MB). Um mês
+        # de uma loja são ~800 execuções; guardar as bem-sucedidas enche o
+        # armazenamento do n8n Cloud sem servir para nada. Erros continuam salvos.
+        "saveDataSuccessExecution": "none",
+        "saveDataErrorExecution": "all",
+        "saveManualExecutions": False,
+        "saveExecutionProgress": False,
+    },
     "pinData": {},
 }
 
 OUT.write_text(json.dumps(workflow, ensure_ascii=False, indent=2), encoding="utf-8")
 JS_OUT.write_text(BUILD_CODE, encoding="utf-8")
+JS_RESPOSTA_OUT.write_text(RESPONSE_CODE, encoding="utf-8")
 print(f"gerado: {OUT.name} ({OUT.stat().st_size} bytes)")
 print(f"gerado: {JS_OUT.name} ({len(BUILD_CODE.splitlines())} linhas, para colar no n8n)")
 print("nodes:", " -> ".join(n["name"] for n in workflow["nodes"]))

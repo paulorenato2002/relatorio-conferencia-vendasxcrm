@@ -274,7 +274,51 @@ def test_recorta_tres_boletas_da_primeira_pagina_da_carla():
 def test_recorta_duas_boletas_da_ester():
     imagens = render_boletas(_scan("boleta ester (51).pdf"))
     assert len(imagens) == 2
-    assert all(img.png[:8] == b"\x89PNG\r\n\x1a\n" for img in imagens)
+    assert all(img.data[:8] == b"\x89PNG\r\n\x1a\n" for img in imagens), "esperava PNG"
+    assert all(img.mime == "image/png" for img in imagens)
+
+
+def test_recorte_e_sem_perda():
+    # JPEG foi medido e piorou a leitura da vendedora cursiva. O PNG entrega ao
+    # modelo exatamente os pixels do recorte, qualquer que seja a compressão.
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    from src.boletas.render import MAX_SHORT_SIDE, _fit_short_side, _iter_pages, find_boleta_columns
+
+    caminho = _scan("boleta ester (51).pdf")
+    pagina = next(_iter_pages(caminho.read_bytes(), caminho.name, 200))
+    esquerda, direita = find_boleta_columns(pagina)[0]
+    original = _fit_short_side(
+        pagina.crop((max(0, esquerda - 8), 0, min(pagina.width, direita + 8), pagina.height)),
+        MAX_SHORT_SIDE,
+    )
+    enviado = render_boletas(caminho)[0]
+    decodificado = Image.open(BytesIO(enviado.data)).convert("RGB")
+    assert np.array_equal(np.asarray(decodificado), np.asarray(original))
+
+
+def test_iter_boletas_devolve_o_mesmo_que_o_recorte_em_lista():
+    from src.boletas.render import iter_boletas
+
+    caminho = _scan("boleta carla (65).pdf")
+    dados = caminho.read_bytes()
+    uma_a_uma = list(iter_boletas(dados, caminho.name))
+    em_lista = render_boletas(caminho)
+    assert [(i.page, i.position, i.data) for i in uma_a_uma] == [
+        (i.page, i.position, i.data) for i in em_lista
+    ]
+
+
+def test_mesmo_arquivo_gera_as_mesmas_imagens():
+    # O cache de leituras depende disto: se o recorte não fosse determinístico,
+    # nada impediria uma boleta de ser paga de novo.
+    caminho = _scan("boleta ester (51).pdf")
+    primeira = [i.data for i in render_boletas(caminho)]
+    segunda = [i.data for i in render_boletas(caminho)]
+    assert primeira == segunda
 
 
 def test_recorte_cabe_na_resolucao_que_o_modelo_aceita_sem_reduzir():

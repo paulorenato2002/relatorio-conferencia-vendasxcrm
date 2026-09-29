@@ -6,13 +6,14 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
-from src.boletas import (
-    BoletaClientError,
-    BoletaParseError,
-    N8nConfig,
-    build_boletas,
-    fetch_boletas,
-    render_many,
+from src.boletas import BoletaClientError, N8nConfig, build_boletas
+from src.boletas.job import (
+    STATUS_CANCELLED,
+    STATUS_PREPARING,
+    LeituraJob,
+    UploadedBatchFile,
+    default_cache,
+    running_jobs,
 )
 from src.boletas.edicao import (
     PAGAMENTOS,
@@ -79,6 +80,48 @@ def _streamlit_secrets() -> dict[str, str]:
         return {key: str(value) for key, value in st.secrets.items()}
     except Exception:
         return {}
+
+
+def _duracao(segundos: float | None) -> str:
+    if segundos is None:
+        return "calculando"
+    minutos, segundos = divmod(int(segundos), 60)
+    if minutos >= 60:
+        horas, minutos = divmod(minutos, 60)
+        return f"{horas}h{minutos:02d}"
+    return f"{minutos} min {segundos:02d} s" if minutos else f"{segundos} s"
+
+
+@st.fragment(run_every=2)
+def _acompanhar_leitura(fingerprint: str) -> None:
+    """Progresso da leitura, atualizado a cada 2 s sem reexecutar a página."""
+    job = running_jobs().get(fingerprint)
+    if job is None:
+        return
+    snap = job.snapshot()
+    if snap.finished:
+        st.rerun()
+        return
+
+    if snap.status == STATUS_PREPARING:
+        st.progress(0.0, text=f"Preparando {snap.total_files} arquivo(s)...")
+    else:
+        texto = f"{snap.done} de ~{snap.estimated_total} boletas lidas"
+        if job.cancelled:
+            texto = "Interrompendo — esperando as boletas que já estavam no n8n..."
+        st.progress(snap.progress, text=texto)
+    colunas = st.columns(4)
+    colunas[0].metric("Páginas recortadas", f"{snap.pages_done}/{snap.total_pages}")
+    colunas[1].metric("Já estavam guardadas", snap.from_cache)
+    colunas[2].metric("Falharam", snap.failed)
+    colunas[3].metric("Tempo restante", _duracao(snap.eta))
+    st.caption(
+        "A leitura roda em segundo plano: pode mexer no resto da tela. Cada boleta "
+        "é guardada assim que volta; se algo interromper, ler de novo continua "
+        "de onde parou."
+    )
+    if not job.cancelled and st.button("Interromper leitura", key="interromper_leitura"):
+        job.cancel()
 
 
 def _boletas_dataframe(data) -> pd.DataFrame:
@@ -302,43 +345,86 @@ boletas_are_current = bool(
     boletas_state and boletas_fingerprint and boletas_state.get("fingerprint") == boletas_fingerprint
 )
 
+job = running_jobs().get(boletas_fingerprint) if boletas_fingerprint else None
+
+# Leitura terminou numa execução anterior do script: passa o resultado para a
+# sessão, onde o resto da tela (correção, aprovação, cruzamento) o encontra.
+if job is not None and job.snapshot().finished and job.snapshot().status != STATUS_CANCELLED:
+    snap = job.snapshot()
+    st.session_state["boletas_leitura"] = {
+        "fingerprint": boletas_fingerprint,
+        "raw": job.results(),
+        "warnings": snap.warnings,
+        "failed": snap.failed,
+        "duplicates": snap.duplicates,
+        "file_names": job.file_names(),
+        "stats": {"total": snap.done, "from_cache": snap.from_cache, "elapsed": snap.elapsed},
+    }
+    running_jobs().pop(boletas_fingerprint, None)
+    job = None
+    boletas_state = st.session_state["boletas_leitura"]
+    boletas_are_current = True
+
 if not boleta_files:
     st.info(
         "Envie as boletas escaneadas para incluí-las na conferência. "
         "A leitura é feita pelo n8n e roda sob demanda."
     )
+elif job is not None and not job.snapshot().finished:
+    _acompanhar_leitura(boletas_fingerprint)
 else:
-    read_clicked = st.button(
-        "Ler boletas no n8n",
-        width="stretch",
-        disabled=boletas_are_current,
-        help="Já lido: reenvie apenas se trocar os arquivos." if boletas_are_current else None,
-    )
+    if job is not None and job.snapshot().status == STATUS_CANCELLED:
+        snap = job.snapshot()
+        st.warning(
+            f"Leitura interrompida com {snap.done} boleta(s) lidas. O que já foi lido "
+            "está guardado: ler de novo continua de onde parou."
+        )
+        running_jobs().pop(boletas_fingerprint, None)
+
+    falhas = (boletas_state or {}).get("failed", 0) if boletas_are_current else 0
+    if boletas_are_current and falhas:
+        rotulo = f"Tentar de novo as {falhas} boleta(s) que falharam"
+    else:
+        rotulo = "Ler boletas no n8n"
+    col_ler, col_reler = st.columns([4, 1])
+    with col_reler:
+        reler = st.checkbox(
+            "Reler tudo",
+            help="Ignora as leituras já guardadas e manda todas as boletas de novo. "
+            "Use depois de mudar o prompt ou o modelo no n8n.",
+        )
+    with col_ler:
+        read_clicked = st.button(
+            rotulo,
+            width="stretch",
+            disabled=boletas_are_current and not falhas and not reler,
+            help="Já lido. Marque “Reler tudo” para ler de novo." if boletas_are_current else None,
+        )
     if read_clicked:
-        progress = st.progress(0.0, text="Recortando as boletas...")
         try:
-            images = render_many(list(boleta_files))
-            progress.progress(0.0, text=f"0 de {len(images)} boletas lidas...")
-
-            def _on_progress(done: int, total: int) -> None:
-                progress.progress(done / total, text=f"{done} de {total} boletas lidas...")
-
-            raw, warnings = fetch_boletas(
-                images, config=N8nConfig.from_env(_streamlit_secrets()), on_progress=_on_progress
-            )
-            st.session_state["boletas_leitura"] = {
-                "fingerprint": boletas_fingerprint,
-                "raw": raw,
-                "warnings": warnings,
-                "file_names": tuple(dict.fromkeys(image.source_file for image in images)),
-            }
-            boletas_state = st.session_state["boletas_leitura"]
-            boletas_are_current = True
-        except (BoletaParseError, BoletaClientError, ValueError) as exc:
-            st.session_state.pop("boletas_leitura", None)
+            config = N8nConfig.from_env(_streamlit_secrets())
+        except BoletaClientError as exc:
             st.error(str(exc))
-        finally:
-            progress.empty()
+        else:
+            arquivos = [UploadedBatchFile(item.name, item.getvalue()) for item in boleta_files]
+            running_jobs()[boletas_fingerprint] = LeituraJob(
+                arquivos, config, default_cache(), ignore_cache=reler
+            ).start()
+            st.session_state.pop("boletas_leitura", None)
+            st.rerun()
+
+    guardados_arquivos, guardadas_boletas = default_cache().size()
+    if guardadas_boletas:
+        with st.expander(f"Leituras guardadas neste computador ({guardadas_boletas})"):
+            st.caption(
+                "Cada boleta lida fica salva em `.cache/leituras/`, para que uma "
+                "leitura interrompida continue de onde parou e o mesmo arquivo não "
+                "seja pago duas vezes. Contém o que foi transcrito, inclusive nome e "
+                "telefone de cliente."
+            )
+            if st.button("Apagar leituras guardadas"):
+                default_cache().clear()
+                st.rerun()
 
 boletas_aprovadas = False
 if boletas_are_current:
@@ -386,8 +472,30 @@ if boletas_are_current:
     boleta_cols[1].metric("Conferem", len(boletas_data.boletas) - len(review))
     boleta_cols[2].metric("A conferir", len(review))
 
-    for message in boletas_data.warnings:
-        st.warning(message)
+    duplicados = boletas_state.get("duplicates") or []
+    if duplicados:
+        st.warning(
+            f"{len(duplicados)} arquivo(s) idênticos a outros foram ignorados, para "
+            "que as mesmas boletas não entrassem duas vezes no cruzamento: "
+            + "; ".join(f"“{copia}” = “{original}”" for copia, original in duplicados)
+        )
+
+    stats = boletas_state.get("stats") or {}
+    if stats.get("from_cache"):
+        st.caption(
+            f"{stats['from_cache']} de {stats['total']} boletas vieram de leituras já "
+            f"guardadas, sem nova chamada ao n8n. Tempo da leitura: {_duracao(stats.get('elapsed'))}."
+        )
+
+    # Num lote de um mês, avisos individuais empilhados escondem a tela; ficam
+    # agrupados quando passam de poucos.
+    if len(boletas_data.warnings) > 3:
+        with st.expander(f"{len(boletas_data.warnings)} aviso(s) da leitura", expanded=False):
+            for message in boletas_data.warnings:
+                st.markdown(f"- {message}")
+    else:
+        for message in boletas_data.warnings:
+            st.warning(message)
 
     fora_do_periodo = sorted(
         day for day in boletas_data.all_dates if not (start_date <= day <= end_date)

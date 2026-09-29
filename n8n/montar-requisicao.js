@@ -230,6 +230,9 @@ if (binarios.length === 0) {
   );
 }
 const propriedade = binarios.includes('boleta') ? 'boleta' : binarios[0];
+// O tipo vem do próprio upload (o app manda PNG), para que outro formato
+// funcione sem mexer aqui.
+const mime = entrada.binary[propriedade]?.mimeType || 'image/png';
 
 // Dois caminhos para o base64. O helper é o correto quando o n8n guarda o
 // binário em disco (o Cloud faz isso acima de certo tamanho) e nem sempre está
@@ -273,7 +276,7 @@ return [{
             { type: 'text', text: USER },
             {
               type: 'image_url',
-              image_url: { url: `data:image/png;base64,${base64}`, detail: 'high' },
+              image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' },
             },
           ],
         },
