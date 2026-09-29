@@ -2,7 +2,7 @@
 
 Aplicação local em Python/Streamlit para conferir, por dia, as vendas do CRM Morana, os valores de PIX e dinheiro dos fechamentos de caixa e as vendas de cartão aprovadas na Rede.
 
-Todo o processamento ocorre em memória durante a sessão do Streamlit. A aplicação não usa banco de dados nem autenticação, e não grava os uploads.
+O processamento ocorre em memória durante a sessão do Streamlit. A aplicação não usa banco de dados nem autenticação, e não grava os arquivos enviados. A única coisa gravada em disco é a transcrição das boletas lidas, em `.cache/leituras/` (fora do git) — ver abaixo.
 
 **Exceção: as boletas escaneadas.** Elas são manuscritas, então a leitura é
 feita por um modelo de visão, através de um workflow no n8n. Quando essa etapa
@@ -77,9 +77,10 @@ Boleta que não fecha, ou que tem campo preenchido e ilegível, aparece na fila
 de revisão da tela em vez de entrar calada no relatório.
 
 **Correção e aprovação.** Apontar o problema sem deixar corrigir não resolve: o
-operador tem o papel na mão. A tela traz duas tabelas editáveis — uma de
-cabeçalhos (data, vendedora, totais, pagamento) e uma de peças (código de
-barras e valor, com linhas que podem ser acrescentadas ou removidas).
+operador tem o papel na mão. A tela traz uma tabela editável com os campos
+manuscritos — data, vendedora, cliente, número, peças, totais, pagamento e
+bandeira. Código de barras e valor de etiqueta ficam de fora: são impressos, e
+o erro de um dígito o cruzamento com o CRM identifica sozinho.
 
 A edição é aplicada sobre a transcrição crua e passa de novo por `build_boletas`,
 ou seja, pelas mesmas checagens da leitura automática. Corrigir um total para
@@ -97,9 +98,85 @@ acusações de venda não registrada que são erro de leitura, não da loja.
 guarda os mesmos dígitos com zeros à esquerda até 13. `barcode_to_crm_code()`
 faz a conversão, que é o que liga a peça da boleta à linha do CRM.
 
-**Custo.** A leitura é a única etapa paga e roda só no clique. O resultado fica
-em cache pelos arquivos enviados: trocar empresa ou período reaproveita a
-transcrição, sem reenviar as imagens.
+### Lote de um mês
+
+Medido com as boletas da Rezende de 01 a 27/09/2026: 63 PDFs, 332 páginas,
+**799 boletas**. A primeira versão tentava ler tudo dentro do clique do botão e
+travava. Três coisas mudaram.
+
+**Leitura em segundo plano** (`src/boletas/job.py`). O Streamlit reexecuta o
+script a cada clique na tela, interrompendo a execução em curso; uma leitura de
+25 minutos dentro do clique era morta pelo primeiro clique em qualquer outro
+lugar e levava junto o que já tinha sido lido. Agora ela roda numa thread
+própria e a tela só acompanha, com progresso e tempo restante. Pode mexer no
+resto da tela, fechar a aba e voltar — reenviar os mesmos arquivos reencontra a
+leitura.
+
+**Leituras guardadas** (`src/boletas/cache.py`). Cada boleta lida é gravada em
+`.cache/leituras/` assim que volta, pelo conteúdo do arquivo (não pelo nome).
+Interrompeu, ler de novo continua de onde parou; o mesmo arquivo nunca é pago
+duas vezes. Arquivos idênticos no mesmo envio — o `21.09` e o `21.09 (1)` que o
+navegador gera — são lidos uma vez só e avisados, senão as peças entrariam em
+dobro no cruzamento. A transcrição inclui nome e telefone de cliente; a tela
+tem um botão para apagar tudo, e `Reler tudo` força nova leitura depois de
+mudar prompt ou modelo no n8n.
+
+**Recorte e envio encadeados.** O recorte gera uma boleta por vez e o envio
+começa na primeira; a memória fica no que está em trânsito. Recortar os 27 dias
+caiu de 308 s para 128 s (a imagem da página ia para PNG e voltava sem
+necessidade), e a primeira boleta sai em 0,4 s em vez de depois de tudo
+recortado. O formato continua PNG: JPEG foi medido e errou a vendedora cursiva
+3x mais.
+
+| 8 em paralelo | resultado |
+|---|---|
+| 95 boletas de um dia cheio | 58 s, nenhum rate limit |
+| vazão | 1,6 boleta/s |
+| um mês de uma loja | ~8 min |
+
+Rate limit da OpenAI é esperado num lote desse tamanho e é tentado de novo com
+espera crescente, em vez de virar boleta perdida. Configuração em `.env`
+(`N8N_BOLETAS_CONCURRENCY`) e ajustes do lado do n8n em
+[`n8n/README.md`](n8n/README.md).
+
+### O que um mês inteiro revelou
+
+As boletas de referência (duas vendedoras, 7 boletas) não mostravam o jeito
+como as outras preenchem. Com as 783 do mês:
+
+- **Data com mês por extenso** — `05/SET`, `19 SET. 2026`, `9 SET`. O parser só
+  entendia `05/09` e **descartava a boleta inteira**: 208 sumiam do relatório.
+  Hoje entende os dois, e data que não dá para interpretar deixa a boleta sem
+  data em vez de derrubá-la.
+- **Data pelo nome do arquivo.** A loja salva `Boletas Leide 05.09.pdf`; o nome
+  bateu com a data escrita em 648 boletas e divergiu em 33, quase todas o
+  modelo comendo um dígito (`1 SET` num arquivo de 21/09). Vale a data do
+  arquivo, a boleta que diverge vai para revisão mostrando as duas, e o que for
+  digitado na tela vale mais que ambas. Cobre também as 99 boletas sem data
+  escrita.
+- **Desconto em porcentagem** — `10%`, `15%`. Era lido como R$ 10,00, sem
+  aviso. Hoje incide sobre o SUB TOTAL (ou a soma das peças), com um centavo de
+  tolerância para o arredondamento do caixa.
+- **Código com um dígito a menos.** 58 códigos lidos com 9 dígitos, nenhum no
+  CRM, onde todos têm 10. O cruzamento passou a reconhecer dígito faltando, além
+  de trocado, como erro de leitura.
+- **Veredito por dia.** Qualquer boleta em revisão travava o dia em REVISAR, e
+  os 22 dias saíam assim. Hoje só trava o que pode esconder peça (Nº PEÇAS que
+  não bate, peça sem valor); total manuscrito que não fecha não mexe no
+  casamento das etiquetas impressas.
+
+Resultado no mesmo lote, sem nenhuma leitura nova: 783 de 783 boletas no
+relatório (eram 570), 1.159 peças casadas com o CRM (eram 690), 415 "só no CRM"
+(eram 993).
+
+**O que ainda é ruído.** Das peças "só na boleta", 219 têm uma de mesmo valor no
+mesmo dia entre as "só no CRM", 89 delas a dois dígitos de distância: é o modelo
+errando o número impresso da etiqueta. A tolerância não foi estendida a dois
+dígitos porque variantes do mesmo produto podem ter códigos próximos e o mesmo
+preço, e casar errado esconderia divergência real. O caminho medido é ler as
+barras: um decodificador de código de barras (formato ITF) acertou 15 de 15
+etiquetas de referência e todas as 711 que conseguiu ler no mês existem no CRM,
+mas só acha 45% das etiquetas a 200 DPI.
 
 ## Regra de cálculo
 

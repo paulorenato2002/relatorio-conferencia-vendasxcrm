@@ -68,7 +68,11 @@ def frames_from_raw(raw: Iterable[RawBoleta]) -> pd.DataFrame:
             valor = payload.get(campo)
             linha[coluna] = valor if campo == "num_pecas" else str(valor or "")
         linhas.append(linha)
-    return pd.DataFrame(linhas, columns=list(COLUNAS))
+    tabela = pd.DataFrame(linhas, columns=list(COLUNAS))
+    # Inteiro que aceita vazio: sem isto a coluna mistura número e None e a
+    # tela mostra "None" nas boletas sem Nº PEÇAS.
+    tabela["Peças"] = pd.to_numeric(tabela["Peças"], errors="coerce").astype("Int64")
+    return tabela
 
 
 def raw_from_frames(raw: Sequence[RawBoleta], headers: pd.DataFrame) -> list[RawBoleta]:
@@ -92,6 +96,10 @@ def raw_from_frames(raw: Sequence[RawBoleta], headers: pd.DataFrame) -> list[Raw
                     )
                 else:
                     payload[campo] = _text(valor)
+            # Data digitada na tela é do operador, que tem o papel na mão: vale
+            # mais que a data do nome do arquivo.
+            if payload["data"] is not None and payload["data"] != _text(item.payload.get("data")):
+                payload["data_confirmada"] = True
         corrigidas.append(
             RawBoleta(
                 source_file=item.source_file,

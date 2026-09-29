@@ -16,9 +16,37 @@ app.py  ──POST multipart──►  Webhook
 O payload fica pequeno, cada boleta tem retentativa própria, o progresso
 aparece na tela conforme cada uma volta, e uma imagem ruim não derruba o lote.
 
-O custo disso é uma execução do n8n por boleta. Um lote de 200 boletas no mês
-são 200 execuções — confira a cota do seu plano antes de rodar um período
-grande pela primeira vez.
+O custo disso é uma execução do n8n por boleta. Um mês de uma loja são ~800
+boletas, então ~800 execuções — duas lojas, ~1.600. Confira a cota mensal do
+seu plano. O app guarda cada leitura (`.cache/leituras/`), então repetir o mesmo
+mês não gasta execução de novo.
+
+## Ajustes para volume
+
+Três ajustes no workflow, feitos depois de medir um mês inteiro. Nenhum é
+obrigatório para o app funcionar — ele já trata rate limit pelo texto do erro —,
+mas os três reduzem custo e falha num lote grande.
+
+1. **Não guardar execuções bem-sucedidas.** `Workflow` → `Settings` →
+   *Save successful production executions*: **Do not save**. Cada execução
+   carrega a imagem e o payload em base64 (~1 MB); guardar 800 por mês enche o
+   armazenamento do n8n Cloud sem servir para nada. As com erro continuam salvas.
+
+2. **Mais retentativas dentro da mesma execução.** Node `OpenAI Visao` → aba
+   `Settings` → *Retry On Fail*: **Max Tries 5**, **Wait Between Tries 5000**.
+   Retentar aqui não gasta execução nova do plano; retentar do lado do app gasta.
+
+3. **Status de origem no erro.** Cole o conteúdo de `montar-resposta.js` no node
+   `Montar resposta`. Ele passa a devolver o status HTTP da OpenAI
+   (`upstream_status`), e o app decide com certeza se vale tentar de novo em vez
+   de depender do texto da mensagem.
+
+Opcional: `montar-requisicao.js` no node `Montar requisicao` passa a respeitar o
+tipo da imagem enviada em vez de assumir PNG. O app manda PNG, então hoje não
+muda nada.
+
+Concorrência medida na conta da Rezende: 8 em paralelo, 95 boletas em 58 s, sem
+rate limit. Configurado no `.env` do app (`N8N_BOLETAS_CONCURRENCY`).
 
 ## Instalação
 

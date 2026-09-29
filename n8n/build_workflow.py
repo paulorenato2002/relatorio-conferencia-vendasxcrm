@@ -22,14 +22,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "workflow.json"
 JS_OUT = HERE / "montar-requisicao.js"
+JS_RESPOSTA_OUT = HERE / "montar-resposta.js"
 
 SYSTEM = """Você transcreve boletas manuscritas de pedido de compra de uma loja de bijuterias (rede Morana). Você devolve apenas o que está escrito. Você nunca inventa, nunca completa e nunca corrige um valor.
 
 LAYOUT DA BOLETA (formulário pré-impresso, preenchido à caneta):
 - Topo, fora da moldura: dois números manuscritos. O da ESQUERDA é o telefone do cliente (9 dígitos, às vezes com DDD). O da DIREITA é o número de controle/venda do sistema (4 a 6 dígitos). Muitas boletas têm só um dos dois, ou nenhum.
-- Dentro da moldura: "Data:" (escrita como 22/09 ou 22/9, normalmente SEM o ano), "Nº" (impresso, não manuscrito), "Vendedora:" e "Cliente:" (manuscritos, primeiro nome).
+- Dentro da moldura: "Data:" (dia e mês, com o mês em número ou abreviado por extenso, normalmente SEM o ano), "Nº" (impresso, não manuscrito), "Vendedora:" e "Cliente:" (manuscritos, primeiro nome).
 - Corpo: linhas de itens. Cada item aparece de uma destas duas formas:
-  (a) ETIQUETA ADESIVA colada na linha, com "R$ 59.90" e, logo abaixo, um código de barras com um número de 10 dígitos impresso (ex.: 2707569661). Este é o caso comum.
+  (a) ETIQUETA ADESIVA colada na linha, com o preço impresso ("R$" seguido do valor) e, logo abaixo, um código de barras com um número de 10 dígitos impresso. Este é o caso comum. Cada etiqueta tem o seu próprio número: leia cada uma separadamente.
   (b) ITEM MANUSCRITO: o código de 10 dígitos escrito à caneta na linha, e o valor escrito na coluna da direita.
 - Rodapé: "SUB TOTAL", "DESCONTO", "TOTAL:" (manuscritos, muitas vezes só o TOTAL é preenchido).
 - Caixas de marcação: BRINDE, PRESENTE, WHATS à esquerda; FORMAS DE PAGAMENTO (PIX, DINHEIRO, CRÉDITO, DEBITO) à direita; CASHBACK, ANIVER, OUTROS na faixa inferior. Marcadas com X ou rabisco.
@@ -41,15 +42,16 @@ TROCA/DEVOLUÇÃO: algumas boletas trazem, nas primeiras linhas, um marcador "(E
 
 REGRAS DE TRANSCRIÇÃO:
 1. Copie os dígitos exatamente como aparecem. Não normalize, não arredonde, não "conserte" um valor que pareça errado.
-2. Valores em reais no formato "159.90" (ponto decimal, sem separador de milhar, sem "R$").
-3. `data`: copie como está escrito, ex.: "22/09". Não invente o ano.
+2. Valores em reais com ponto decimal e duas casas, sem separador de milhar e sem "R$".
+3. `data`: copie como está escrito. Não invente o ano.
 4. Campo em branco no papel -> null. Não confunda com ilegível.
 5. Campo preenchido mas que você NÃO consegue ler com segurança -> null, E acrescente o nome do campo em `campos_ilegiveis`. Chutar é pior que admitir. Exemplo: um nome de cliente em cursiva fechada vira `cliente: null` + `campos_ilegiveis: ["cliente"]`.
 6. Dígito rasurado ou sobrescrito: transcreva sua melhor leitura E inclua o campo em `campos_ilegiveis`.
 7. `pagamento`: exatamente um de "pix", "dinheiro", "credito", "debito", ou null se nenhuma caixa estiver marcada.
 8. `num_pecas`: o número dentro do quadro, não a contagem que você fez dos itens. Se estiver em branco, null.
 9. NÃO calcule nada. Se o SUB TOTAL está em branco no papel, devolva null — mesmo que você consiga somar os itens. A conferência aritmética é feita depois, fora daqui, e depende de receber o que está escrito.
-10. A imagem contém UMA boleta. Se houver pedaço de outra boleta na borda, ignore."""
+10. A imagem contém UMA boleta. Se houver pedaço de outra boleta na borda, ignore.
+11. Código de etiqueta que você não consegue ler dígito por dígito: `codigo: null` e inclua "itens" em `campos_ilegiveis`. Nunca complete um código com dígitos de outra etiqueta, de outra boleta ou de qualquer número que apareça nestas instruções."""
 
 USER = "Transcreva esta boleta seguindo as regras. Devolva apenas o JSON."
 
@@ -62,7 +64,7 @@ ITEM_SCHEMA = {
             "type": ["string", "null"],
             "description": "Código de 10 dígitos da etiqueta, apenas dígitos.",
         },
-        "valor": {"type": ["string", "null"], "description": "Valor da peça, ex.: '59.90'."},
+        "valor": {"type": ["string", "null"], "description": "Valor da peça, com ponto decimal e duas casas."},
         "manuscrito": {
             "type": "boolean",
             "description": "true quando o item foi escrito à caneta em vez de etiqueta.",
@@ -82,7 +84,7 @@ SCHEMA = {
     "properties": {
         "numero": {"type": ["string", "null"], "description": "Nº impresso da boleta."},
         "numero_controle": {"type": ["string", "null"], "description": "Número manuscrito no canto superior direito."},
-        "data": {"type": ["string", "null"], "description": "Como escrito, ex.: '22/09'."},
+        "data": {"type": ["string", "null"], "description": "Como escrito na boleta."},
         "vendedora": {"type": ["string", "null"]},
         "cliente": {"type": ["string", "null"]},
         "telefone": {"type": ["string", "null"], "description": "Número manuscrito no canto superior esquerdo."},
@@ -133,6 +135,9 @@ if (binarios.length === 0) {
   );
 }
 const propriedade = binarios.includes('boleta') ? 'boleta' : binarios[0];
+// O tipo vem do próprio upload (o app manda PNG), para que outro formato
+// funcione sem mexer aqui.
+const mime = entrada.binary[propriedade]?.mimeType || 'image/png';
 
 // Dois caminhos para o base64. O helper é o correto quando o n8n guarda o
 // binário em disco (o Cloud faz isso acima de certo tamanho) e nem sempre está
@@ -176,7 +181,7 @@ return [{
             { type: 'text', text: USER },
             {
               type: 'image_url',
-              image_url: { url: `data:image/png;base64,${base64}`, detail: 'high' },
+              image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' },
             },
           ],
         },
@@ -190,7 +195,7 @@ return [{
     "schema": json.dumps(SCHEMA, ensure_ascii=False, indent=2),
 }
 
-RESPONSE_CODE = """// Desempacota a resposta do OpenAI no contrato acordado com o app Python.
+RESPONSE_CODE = r"""// Desempacota a resposta do OpenAI no contrato acordado com o app Python.
 // Falha vira { error }: o cliente registra um aviso naquela boleta e segue com
 // o resto do lote, em vez de derrubar a leitura inteira.
 const origem = $('Montar requisicao').first().json;
@@ -205,8 +210,15 @@ const resposta = $input.first().json;
 const conteudo = resposta?.choices?.[0]?.message?.content;
 
 if (!conteudo) {
-  const motivo = resposta?.error?.message || 'o modelo não devolveu conteúdo';
-  return [{ json: { ...identidade, error: `Falha na leitura: ${motivo}` } }];
+  const erro = resposta?.error || {};
+  const motivo = erro.message || erro.description || 'o modelo não devolveu conteúdo';
+  // Status HTTP da OpenAI, quando houver: é o que diz ao app se a falha é
+  // passageira (429, 5xx — vale tentar de novo) ou definitiva.
+  const status = Number(
+    erro.httpCode || erro.status || erro.cause?.status ||
+    (String(motivo).match(/\b(4\d\d|5\d\d)\b/) || [])[1]
+  ) || null;
+  return [{ json: { ...identidade, upstream_status: status, error: `Falha na leitura: ${motivo}` } }];
 }
 
 let boleta;
@@ -268,8 +280,8 @@ workflow = {
             "notes": "Structured Outputs garante a forma do JSON. A chave fica na credencial OpenAI.",
             "notesInFlow": True,
             "retryOnFail": True,
-            "maxTries": 3,
-            "waitBetweenTries": 2000,
+            "maxTries": 5,
+            "waitBetweenTries": 5000,
             "onError": "continueRegularOutput",
         },
         {
@@ -295,12 +307,22 @@ workflow = {
         "OpenAI Visao": {"main": [[{"node": "Montar resposta", "type": "main", "index": 0}]]},
         "Montar resposta": {"main": [[{"node": "Responder", "type": "main", "index": 0}]]},
     },
-    "settings": {"executionOrder": "v1"},
+    "settings": {
+        "executionOrder": "v1",
+        # Cada execução carrega a imagem e o payload em base64 (~1 MB). Um mês
+        # de uma loja são ~800 execuções; guardar as bem-sucedidas enche o
+        # armazenamento do n8n Cloud sem servir para nada. Erros continuam salvos.
+        "saveDataSuccessExecution": "none",
+        "saveDataErrorExecution": "all",
+        "saveManualExecutions": False,
+        "saveExecutionProgress": False,
+    },
     "pinData": {},
 }
 
 OUT.write_text(json.dumps(workflow, ensure_ascii=False, indent=2), encoding="utf-8")
 JS_OUT.write_text(BUILD_CODE, encoding="utf-8")
+JS_RESPOSTA_OUT.write_text(RESPONSE_CODE, encoding="utf-8")
 print(f"gerado: {OUT.name} ({OUT.stat().st_size} bytes)")
 print(f"gerado: {JS_OUT.name} ({len(BUILD_CODE.splitlines())} linhas, para colar no n8n)")
 print("nodes:", " -> ".join(n["name"] for n in workflow["nodes"]))

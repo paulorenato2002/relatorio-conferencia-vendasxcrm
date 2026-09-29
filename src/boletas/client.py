@@ -17,10 +17,13 @@ from datetime import date
 import json
 import os
 from pathlib import Path
+import random
+import re
 import time
 from typing import Callable, Iterable
 
 import requests
+import requests.adapters
 
 from src.boletas.render import BoletaImage
 from src.boletas.schema import BoletaSchemaError, build_boleta, flag_date_outliers
@@ -33,10 +36,13 @@ class BoletaClientError(RuntimeError):
 
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_ATTEMPTS = 3
-DEFAULT_CONCURRENCY = 4
+DEFAULT_CONCURRENCY = 8
 DEFAULT_HEADER = "X-Boletas-Token"
 
 _RETRY_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# Rate limit é o limite de ritmo da conta da OpenAI, esperado num lote grande.
+_RATE_LIMIT_ATTEMPTS = 8
+_MAX_BACKOFF = 60.0
 
 _DOTENV = Path(__file__).resolve().parents[2] / ".env"
 
@@ -99,13 +105,61 @@ def _headers(config: N8nConfig) -> dict[str, str]:
     return headers
 
 
+class RetryableError(Exception):
+    """Falha passageira: vale esperar e mandar de novo.
+
+    `retry_after` vem do cabeçalho `Retry-After` ou do texto da OpenAI ("Please
+    try again in 1.2s"), quando há; senão a espera é a exponencial padrão.
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None, rate_limited: bool = False):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.rate_limited = rate_limited
+
+
+# O texto de erro repassado pelo n8n é a única pista de que a falha foi da
+# OpenAI e passageira. Com o workflow antigo, que não devolve o status HTTP de
+# origem, é por aqui que um rate limit deixa de virar leitura perdida.
+_TRANSIENT_PATTERNS = re.compile(
+    r"rate.?limit|too many requests|\b429\b|\b50[0234]\b|timed? ?out|timeout|"
+    r"overloaded|server.?error|server had an error|temporarily|try again|"
+    r"ECONNRESET|socket hang up",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_PATTERNS = re.compile(r"rate.?limit|too many requests|\b429\b", re.IGNORECASE)
+_TRY_AGAIN_IN = re.compile(r"try again in\s+([\d.]+)\s*(ms|s)\b", re.IGNORECASE)
+
+
+def _retry_after_from_text(text: str) -> float | None:
+    match = _TRY_AGAIN_IN.search(text or "")
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value / 1000 if match.group(2).lower() == "ms" else value
+
+
+def _retry_after_from_header(response: requests.Response) -> float | None:
+    raw = response.headers.get("Retry-After")
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
 def _post_once(
     session: requests.Session, config: N8nConfig, image: BoletaImage
 ) -> dict:
     response = session.post(
         config.webhook_url,
         headers=_headers(config),
-        files={"boleta": (f"{image.page}-{image.position}.png", image.png, "image/png")},
+        files={
+            "boleta": (
+                f"{image.page}-{image.position}.{image.extension}",
+                image.data,
+                image.mime,
+            )
+        },
         data={
             "source_file": image.source_file,
             "page": str(image.page),
@@ -115,8 +169,10 @@ def _post_once(
         timeout=config.timeout,
     )
     if response.status_code in _RETRY_STATUSES:
-        raise requests.HTTPError(
-            f"HTTP {response.status_code}", response=response
+        raise RetryableError(
+            f"n8n respondeu HTTP {response.status_code}",
+            retry_after=_retry_after_from_header(response),
+            rate_limited=response.status_code == 429,
         )
     if response.status_code >= 400:
         detail = response.text.strip()[:300]
@@ -133,7 +189,11 @@ def _post_once(
 
 
 def _extract(payload: object) -> dict:
-    """Aceita `{...}`, `{"boleta": {...}}` e a lista que o n8n devolve por padrão."""
+    """Aceita `{...}`, `{"boleta": {...}}` e a lista que o n8n devolve por padrão.
+
+    Um `{error}` vindo do workflow é classificado: falha passageira da OpenAI
+    (rate limit, sobrecarga, timeout) volta a ser tentada; o resto é definitivo.
+    """
     if isinstance(payload, list):
         if not payload:
             raise BoletaSchemaError("O n8n devolveu uma lista vazia.")
@@ -141,9 +201,50 @@ def _extract(payload: object) -> dict:
     if not isinstance(payload, dict):
         raise BoletaSchemaError("O n8n não devolveu um objeto JSON.")
     if "error" in payload and payload["error"]:
-        raise BoletaSchemaError(str(payload["error"]))
+        message = str(payload["error"])
+        upstream = payload.get("upstream_status")
+        try:
+            upstream = int(upstream) if upstream is not None else None
+        except (TypeError, ValueError):
+            upstream = None
+        transient = (upstream in _RETRY_STATUSES) or bool(_TRANSIENT_PATTERNS.search(message))
+        if transient:
+            raise RetryableError(
+                message,
+                retry_after=_retry_after_from_text(message),
+                rate_limited=upstream == 429 or bool(_RATE_LIMIT_PATTERNS.search(message)),
+            )
+        raise BoletaSchemaError(message)
     inner = payload.get("boleta")
     return inner if isinstance(inner, dict) else payload
+
+
+def _backoff(attempt: int, retry_after: float | None, rate_limited: bool) -> float:
+    """Espera antes da próxima tentativa, com jitter para não sincronizar threads.
+
+    Rate limit espera mais: é a OpenAI pedindo para diminuir o ritmo, e voltar
+    em um segundo com quatro threads só renova o bloqueio.
+    """
+    base = 2.0 if rate_limited else 1.0
+    wait = min(_MAX_BACKOFF, base * 2 ** (attempt - 1))
+    if retry_after is not None:
+        wait = max(wait, retry_after)
+    return min(_MAX_BACKOFF, wait * random.uniform(0.8, 1.3))
+
+
+def new_session(concurrency: int) -> requests.Session:
+    """Sessão com pool do tamanho da concorrência.
+
+    O padrão do `requests` guarda 10 conexões por host; acima disso cada
+    requisição excedente abre e descarta conexão, e o log enche de aviso.
+    """
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1, pool_maxsize=max(10, concurrency * 2)
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,10 +263,22 @@ class RawBoleta:
 
 
 def fetch_boleta(
-    session: requests.Session, config: N8nConfig, image: BoletaImage
+    session: requests.Session,
+    config: N8nConfig,
+    image: BoletaImage,
+    should_stop: Callable[[], bool] | None = None,
 ) -> RawBoleta:
+    """Lê uma boleta, tentando de novo enquanto a falha for passageira.
+
+    Rate limit ganha mais tentativas que as outras falhas: num lote de 800 ele
+    é esperado, não excepcional, e desistir cedo transforma o limite de ritmo da
+    OpenAI em boleta perdida.
+    """
     last_error: Exception | None = None
-    for attempt in range(1, config.attempts + 1):
+    limit = config.attempts
+    attempt = 0
+    while attempt < limit:
+        attempt += 1
         try:
             response = _post_once(session, config, image)
             return RawBoleta(
@@ -174,14 +287,26 @@ def fetch_boleta(
                 position=image.position,
                 payload=_extract(response),
             )
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+        except RetryableError as exc:
             last_error = exc
-            if attempt < config.attempts:
-                time.sleep(min(2 ** (attempt - 1), 8))
+            if exc.rate_limited:
+                limit = max(limit, _RATE_LIMIT_ATTEMPTS)
+            wait = _backoff(attempt, exc.retry_after, exc.rate_limited)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            wait = _backoff(attempt, None, False)
         except BoletaSchemaError as exc:
             raise BoletaClientError(f"{image.image_id}: {exc}") from exc
+        if attempt >= limit:
+            break
+        # Dorme em fatias para que um cancelamento não espere o backoff inteiro.
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if should_stop and should_stop():
+                raise BoletaClientError(f"{image.image_id}: leitura cancelada.")
+            time.sleep(min(0.25, deadline - time.monotonic()))
     raise BoletaClientError(
-        f"{image.image_id}: o n8n não respondeu após {config.attempts} tentativas "
+        f"{image.image_id}: o n8n não respondeu após {attempt} tentativa(s) "
         f"({last_error})."
     )
 
@@ -205,7 +330,7 @@ def fetch_boletas(
     warnings: list[str] = []
     done = 0
 
-    with requests.Session() as session:
+    with new_session(config.concurrency) as session:
         with ThreadPoolExecutor(max_workers=max(1, config.concurrency)) as pool:
             futures = [
                 pool.submit(fetch_boleta, session, config, image) for image in images

@@ -16,3 +16,6 @@ output/
 .env.*
 !.env.example
 .streamlit/secrets.toml
+
+# Leituras das boletas guardadas pelo app (contem nome e telefone de cliente)
+.cache/

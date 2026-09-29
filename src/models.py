@@ -21,6 +21,10 @@ class CrmItem:
     gross_cents: int
     quantity: int
     product: str
+    # Coluna `valor`: o bruto menos o desconto da venda. É o que o cliente pagou
+    # e o que o TOTAL manuscrito da boleta registra. `None` quando a planilha não
+    # traz a coluna.
+    net_cents: int | None = None
 
     @property
     def is_return(self) -> bool:
@@ -184,6 +188,15 @@ class Boleta:
     unreadable_fields: tuple[str, ...]
     checks: tuple[str, ...]
     date_suspect: bool = False
+    # "boleta" (lida no papel), "arquivo" (nome do arquivo) ou "confirmada"
+    # (digitada na tela). Só a lida sem arquivo datado passa pela conferência de
+    # consenso entre boletas: as outras duas já têm fonte melhor.
+    date_source: str = "boleta"
+    # Há dúvida sobre as peças lidas — nenhuma lida, peça sem valor, ou Nº PEÇAS
+    # diferente da quantidade lida. Só isto impede o cruzamento de concluir
+    # divergência no dia. Totais manuscritos que não fecham não entram: o
+    # cruzamento compara as etiquetas impressas, não os totais.
+    items_uncertain: bool = False
 
     @property
     def image_id(self) -> str:
