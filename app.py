@@ -82,6 +82,22 @@ def _streamlit_secrets() -> dict[str, str]:
         return {}
 
 
+_MARKDOWN_ESPECIAIS = ("\\", "$", "*", "_", "`")
+
+
+def _md(texto: object) -> str:
+    """Texto dinâmico seguro para `st.markdown`.
+
+    O markdown do Streamlit lê o trecho entre dois `$` como fórmula: um aviso
+    como "SUB TOTAL (R$ 129,80) difere do TOTAL (R$ 116,80)" saía com os `R$`
+    sumidos e o miolo em fonte de fórmula.
+    """
+    resultado = str(texto)
+    for caractere in _MARKDOWN_ESPECIAIS:
+        resultado = resultado.replace(caractere, "\\" + caractere)
+    return resultado
+
+
 def _duracao(segundos: float | None) -> str:
     if segundos is None:
         return "calculando"
@@ -492,7 +508,7 @@ if boletas_are_current:
     if len(boletas_data.warnings) > 3:
         with st.expander(f"{len(boletas_data.warnings)} aviso(s) da leitura", expanded=False):
             for message in boletas_data.warnings:
-                st.markdown(f"- {message}")
+                st.markdown(f"- {_md(message)}")
     else:
         for message in boletas_data.warnings:
             st.warning(message)
@@ -515,9 +531,9 @@ if boletas_are_current:
                 rotulo = f"{boleta.source_file} · p{boleta.page}/{boleta.position}"
                 if boleta.numero:
                     rotulo += f" · Nº {boleta.numero}"
-                st.markdown(f"**{rotulo}**")
+                st.markdown(f"**{_md(rotulo)}**")
                 for check in boleta.checks:
-                    st.markdown(f"- {check}")
+                    st.markdown(f"- {_md(check)}")
                 for field in boleta.unreadable_fields:
                     st.markdown(f"- campo `{field}` preenchido no papel, mas ilegível")
 
@@ -534,8 +550,9 @@ if boletas_are_current:
         if review:
             rotulo = f"Aprovar mesmo com {len(review)} boleta(s) a conferir"
             st.caption(
-                "Aprovar sem corrigir é possível: as boletas seguem marcadas e o "
-                "cruzamento não conclui divergência em cima delas."
+                "Aprovar sem corrigir é possível: as boletas seguem marcadas, e o dia "
+                "de uma boleta com dúvida nas próprias peças sai como REVISAR em vez "
+                "de DIVERGÊNCIA."
             )
         if st.button(rotulo, type="primary", width="stretch"):
             st.session_state["boletas_aprovacao"] = assinatura
@@ -702,9 +719,12 @@ if processed and processed.get("fingerprint") == processed_fingerprint:
             )
             for item in suspeitas:
                 st.markdown(
-                    f"- {format_date_br(item.date)} · "
-                    f"{format_brl_currency(item.value_cents)} · {item.note}"
-                    + (f" · {item.product}" if item.product else "")
+                    "- "
+                    + _md(
+                        f"{format_date_br(item.date)} · "
+                        f"{format_brl_currency(item.value_cents)} · {item.note}"
+                        + (f" · {item.product}" if item.product else "")
+                    )
                 )
     elif cross is not None:
         st.info(
